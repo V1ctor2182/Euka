@@ -1,0 +1,96 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.sw?
+
+# Secrets — API keys, tokens (loaded by server.mjs via process.loadEnvFile)
+.env
+.env.local
+.env.*.local
+
+# ─────────────────────────────────────────────────────────────
+# Career data (data/career/) — PUBLIC REPO: track ONLY example /
+# config / fixture / structure files. Everything personal is ignored.
+# ─────────────────────────────────────────────────────────────
+
+# Dashboard-root data files (not used here, defensive)
+data/*.json
+data/*.jsonl
+
+# Sensitive personal / OAuth / state
+data/career/identity.yml
+data/career/preferences.yml
+data/career/narrative.md
+data/career/proof-points.md
+data/career/.oauth.json
+data/career/cv.gdoc-id.local
+
+# Ephemeral runtime state / logs (regenerated per run)
+data/career/applications.json
+data/career/pipeline.json
+data/career/raw-scan/
+data/career/scan-history.jsonl
+data/career/archive.jsonl
+data/career/scan-cadence-state.json
+data/career/scan-cadence-state.json.smoke-backup.*
+data/career/llm-costs.jsonl
+data/career/followup-templates.md
+
+# QA Bank: real legal answers + history are private (keep legal.example.yml)
+data/career/qa-bank/legal.yml
+data/career/qa-bank/history.jsonl
+data/career/qa-bank/templates.md
+
+# Resumes: actual content is private (keep README + .gitkeep)
+data/career/resumes/*/
+data/career/portals.yml
+
+# Generated / transient outputs
+data/career/reports/*
+data/career/output/*
+data/career/drafts/*
+data/career/feedback/*
+data/career/apply-sessions/*
+data/career/.playwright/
+
+# Self-test / tuner outputs (regenerable)
+data/career/eval-fixtures/proposed-allowlist.txt
+data/career/eval-fixtures/proposed-allowlist.diff
+data/career/eval-fixtures/tuner-log.json
+data/career/eval-fixtures/promote-queue/
+data/career/eval-fixtures/applier-selftest-report.json
+
+# Keep structure: .gitkeep + README survive the dir-level ignores above
+!data/career/reports/.gitkeep
+!data/career/output/.gitkeep
+!data/career/drafts/.gitkeep
+!data/career/feedback/.gitkeep
+!data/career/apply-sessions/.gitkeep
+!data/career/resumes/.gitkeep
+!data/career/reports/README.md
+!data/career/output/README.md
+!data/career/drafts/README.md
+!data/career/feedback/README.md
+!data/career/apply-sessions/README.md
+!data/career/resumes/README.md
+
+# Plugin-managed skill / agent installs
+.agents/
+.claude/skills/
+.claude/agents/
+skills/
+skills-lock.json

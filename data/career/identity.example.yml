@@ -1,0 +1,28 @@
+# identity.example.yml — copy to identity.yml (gitignored) and fill in your
+# own details. `npm run init:career` does this copy for you. The applier's
+# field classifier reads identity.yml to auto-fill name/email/phone/etc.
+name: Jordan Lee
+email: jordan.lee@example.com
+phone: +1-555-123-4567
+links:
+  linkedin: https://www.linkedin.com/in/jordan-lee-example/
+  github: https://github.com/jordan-lee-example
+  portfolio: https://www.example.com/
+location:
+  current_city: New York
+  current_country: United States
+legal:
+  visa_status: Citizen
+  visa_expiration: ''
+  needs_sponsorship_now: false
+  needs_sponsorship_future: false
+  authorized_us_yes_no: true
+  citizenship: United States
+education:
+  - school: Example University
+    degree: BS Computer Science
+    graduation: '2024'
+    gpa: '3.7'
+languages:
+  - lang: English
+    level: Native

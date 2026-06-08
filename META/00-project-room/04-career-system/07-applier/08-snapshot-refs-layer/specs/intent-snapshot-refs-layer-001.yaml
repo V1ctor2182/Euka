@@ -1,0 +1,188 @@
+spec_id: "intent-snapshot-refs-layer-001"
+type: intent
+state: active
+intent:
+  summary: "Token-efficient LLM-facing page abstraction — snapshot + symbolic refs (借鉴 Vercel agent-browser)"
+  detail: |
+    Mode 2 Full Agent 的 LLM-facing 抽象层，sits between 02-playwright-runtime
+    (Chromium 底座) and 03-field-classifier / 04-multi-step-state-machine /
+    05-non-standard-controls / 06-site-adapters (所有需要"看页面 → 决定动作"的
+    消费者)。
+
+    核心问题：传统 Playwright + LLM 方案让模型看到完整 a11y 树 / DOM dump
+    (~7000-8000 tokens 每个 ATS apply 页面)，且模型要从 noise 里挑出 CSS
+    selector / XPath 写回 prompt — token 贵 + 模型瞎猜 selector 出错率高。
+
+    设计 (借鉴 vercel-labs/agent-browser 的 IP，不用其 Rust 二进制):
+      (1) snapshot(page, interactive=true) — 遍历 page.accessibility.snapshot()
+          过滤出 interactive roles {button, link, textbox, checkbox, radio,
+          combobox, menuitem, tab, heading, ...}，每个 node 输出一行：
+            - role "accessible-name" [ref=eN] [extra-attrs?]
+          一整个 ATS apply 页面压到 200-400 tokens（~20× 节省）。
+          [headings 是否保留为 LLM 导航锚点，见 open_questions Q2]
+      (2) Ref table — 计数器 mint `eN`，server 端 Map { eN → ElementHandle }。
+          作用域 = per-Page（跟 Playwright Page 生命周期对齐，Page 关闭/重定向
+          整张表清空）。Snapshot 返回时同时 freeze 这张表为新一代 generation。
+      (3) Symbolic action API — `click @e2`, `fill @e3 "value"`,
+          `select @e4 "option"`, `press @e5 "Enter"`, `upload @e6 "/path.pdf"`
+          —— resolve `@eN` → 内部 handle → 调用 Playwright 原生方法。模型
+          NEVER sees DOM ids / classes / XPaths / coordinates。LLM tool
+          surface 只暴露 ~10 个符号动词，**绝不暴露 page.locator / page.eval
+          / 任何 raw Playwright API**（见 constraints C1）。
+      (4) Invalidation — **pessimistic post-action invalidation 为主信号**:
+          任何 mutating action (click/fill/press/upload/select) 完成后立刻把
+          当前 ref table 标 stale。原因：Greenhouse/Lever/Ashby/Workday 全是
+          SPA，用 history.pushState 路由，framenavigated/domcontentloaded
+          都不 fire — 只有 post-action 信号能稳定捕捉 SPA 切换。**附加信号**:
+          framenavigated（兜底 hard navigation）+ Page close（清整张表）。
+          约定: snapshot → act → re-snapshot loop，每次 act 后必须 re-snapshot
+          才能继续 act。
+      (5) Stale-ref guard + 统一错误码 — 三类失败：
+            STALE_REF      → 引用的 generation 已被 invalidate（act 后未 re-snapshot）
+            UNKNOWN_REF    → eN 从未在任何 snapshot 出现过
+            ELEMENT_GONE   → ref 对应的 ElementHandle 底层 node 已 detach
+                             （Playwright 抛 TargetClosedError/ElementHandleError，
+                             由 action wrapper catch 后翻译）
+          三类一律附带 hint "call snapshot first"，避免模型瞎猜继续。
+      (6) Daemon warmth — 长期常驻 Node process (server.mjs 内 module 单例)
+          复用 Playwright browser context，每个 LLM tool call < 200ms (vs
+          Playwright cold-start 1-2s)。
+      (7) iframe handling — V1 默认 inline-recurse iframe content into 父
+          snapshot，ref 用全局 eN 编号（不分 frame）；action resolve 时通过
+          ref→frame 反查表找到正确 Frame 调 .click()。这让 LLM 看到统一视图，
+          不用关心 frame 边界（Greenhouse 几乎所有 form 都在 iframe 里，
+          强制 LLM 切 frame 体验差）。[最终格式见 open_questions Q1]
+
+    Consumers (downstream Rooms):
+      - 03-field-classifier: snapshot 输出喂给 Sonnet 分类器，得到字段 class
+      - 04-multi-step-state-machine: 每步 snapshot 后 LLM 判断 "下一步 ref" /
+        "页面变了，re-snapshot"
+      - 05-non-standard-controls: 用 ref 定位非标控件 + 走特化策略
+      - 06-site-adapters: site-specific snapshot 提示（如 Workday 给 ref 加
+        step prefix，让 LLM 知道当前在 step 几）
+
+    NOT in scope:
+      - 反检测 / stealth (那是 02-playwright-runtime)
+      - 视觉 fallback / multimodal screenshot 分析 (DOM-only V1；screenshot
+        是单独的 explicit `screenshot @eN` 命令，不混入 snapshot 输出)
+      - 跨 tab / 跨 window 状态同步 (single-page V1)
+      - MCP server 包装 (defer to 07-feedback-flywheel 或单独 Room)
+      - Drag-drop file upload (V1 只支持 input[type=file]；drag-drop 见
+        open_questions Q5)
+
+    Estimated complexity: ~300-500 LOC TypeScript (serializer + ref table +
+    symbolic action wrappers + invalidation listener + iframe inline recurse +
+    Playwright-error→统一错误码 wrapper) + ~150-200 LOC smoke (snapshot
+    stability across mutations, ref resolve correctness, stale-ref error path,
+    token-budget assertion, handle-leak assertion).
+
+    验收：
+      (a) 给一个真实 Greenhouse apply 页 URL (含 iframe), snapshot 输出
+          < 500 tokens 且能让 Sonnet 100% 识别 8 个核心字段 (Name/Email/
+          Phone/Resume/LinkedIn/Cover/EEO/Authorization)
+      (b) Workday 最坏 case 单步 30-50 fields 页面，snapshot 输出 < 1500 tokens
+      (c) ref click/fill 100% 命中 vs Playwright 直接 selector
+      (d) DOM 变更后 stale ref 100% 触发 STALE_REF 错误（不 silent 误操作）;
+          unknown ref 触发 UNKNOWN_REF; detached node 触发 ELEMENT_GONE
+      (e) SPA 路由切换 (Greenhouse 主页 → form iframe) 后旧 ref 100% stale
+      (f) 同 tab 8 次 snapshot → act → re-snapshot 循环，Playwright context
+          内部 element-handle Map size 不单调增长 (no handle leak)
+constraints:
+  - id: "constraint-C1-llm-tool-surface"
+    severity: must_not
+    rule: "LLM tool surface MUST NOT expose raw Playwright API (page.locator / page.eval / page.$ / setInputFiles 等). 只暴露 ~10 个符号动词 (snapshot/click/fill/select/press/upload/screenshot/wait_navigation/wait_text/close). Fallback 通道一旦存在，模型会偷懒回去写 selector，整层抽象失效。"
+  - id: "constraint-C2-snapshot-output-purity"
+    severity: must_not
+    rule: "Snapshot 输出 MUST NOT contain DOM id / class / XPath / CSS selector / inline-style / data-* 任意一种. 只允许: role / accessible-name / ref / 必要的 ARIA state (checked/selected/expanded/disabled/required)."
+  - id: "constraint-C3-pessimistic-invalidation"
+    severity: must
+    rule: "MUST pessimistic invalidate ref table after every mutating action (click/fill/press/upload/select). 不依赖 framenavigated/domcontentloaded — SPA 路由会绕过它们."
+  - id: "constraint-C4-unified-error-codes"
+    severity: must
+    rule: "Action wrapper MUST catch Playwright 原生 errors (TargetClosedError / ElementHandleError / Timeout) 并翻译成统一错误码 (STALE_REF / UNKNOWN_REF / ELEMENT_GONE / ACTION_TIMEOUT). 错误码 + hint 'call snapshot first' 喂给 LLM."
+  - id: "constraint-C5-dom-only-v1"
+    severity: must
+    rule: "V1 MUST be DOM-only (snapshot 不含 screenshot bytes). Screenshot 是 explicit `screenshot @eN` 命令，不混入 snapshot 输出. Vision fallback 留给未来 Room."
+  - id: "constraint-C6-no-auth-vault"
+    severity: must_not
+    rule: "MUST NOT 自写 credential vault. ATS 登录用 Playwright storage_state.json 持久化机制 (一次性 headful 手动登录 + 长期 cookie 持久化). 不端口 agent-browser 的 auth 命令，不存密码."
+indexing:
+  type: intent
+  priority: high
+  layer: feature
+  domain: "04-career-system"
+  tags: [backend, playwright, llm-agent, token-efficiency, a11y, spa]
+provenance:
+  source_type: research
+  confidence: 0.9
+  source_ref: "vercel-labs/agent-browser (Jan 2026) — snapshot+refs pattern; researched + design-reviewed 2026-05-11"
+relations:
+  - type: depends_on
+    target: "intent-playwright-runtime-001"
+  - type: foundation_for
+    target: "00-project-room/04-career-system/07-applier/03-field-classifier"
+  - type: foundation_for
+    target: "00-project-room/04-career-system/07-applier/04-multi-step-state-machine"
+  - type: foundation_for
+    target: "00-project-room/04-career-system/07-applier/05-non-standard-controls"
+  - type: foundation_for
+    target: "00-project-room/04-career-system/07-applier/06-site-adapters"
+open_questions:
+  - id: "Q1-iframe-format"
+    question: "iframe 是 inline-recurse 进父 snapshot（V1 default）还是要 LLM 显式 `frame switch @fN` 命令？影响：inline 让 LLM 体验统一但 ref→frame 反查表复杂；显式 frame 更可控但 LLM 要管 frame 状态."
+    options: ["inline-recurse (default)", "explicit frame switch", "hybrid: top-level inline + nested 显式"]
+    lock_before: "plan-milestones"
+  - id: "Q2-heading-inclusion"
+    question: "Snapshot 是否保留 heading 节点作 LLM navigation aid？agent-browser 保留；纯交互角度可以过滤掉."
+    options: ["keep (agent-browser parity)", "filter out (interactive-only strict)"]
+    lock_before: "plan-milestones"
+    recommendation: "keep — 帮 LLM 判断当前在哪一步页面，Workday 多步表单尤其需要"
+  - id: "Q3-action-auto-wait-timeout"
+    question: "click/fill 等动作默认 timeout 几秒？Playwright 默认 30s. ATS 页面慢可能要更长."
+    options: ["5s", "10s", "30s (Playwright default)", "configurable per-action"]
+    lock_before: "plan-milestones"
+    recommendation: "10s default + per-action override 参数"
+  - id: "Q4-no-accessible-name"
+    question: "Icon button / image-only button 在 a11y 树里 name='' 的怎么 emit？skip / fallback aria-label / fallback title?"
+    options: ["skip (LLM 看不见就不会用)", "fallback aria-label", "fallback title", "fallback to nearest text content"]
+    lock_before: "plan-milestones"
+    recommendation: "fallback aria-label → title → skip — Workday 大量用 icon button (X 关闭 / ? help)"
+  - id: "Q5-drag-drop-upload"
+    question: "Non-input file upload (drag-drop dropzone) V1 支持吗？需要 CDP Input.dispatchDragEvent."
+    options: ["V1 不支持 (只 input[type=file])", "V1 支持 (~30 LOC CDP wrap)"]
+    lock_before: "plan-milestones"
+    recommendation: "V1 不支持 — Greenhouse/Lever 都用 input[type=file]，drag-drop 是 Workday 特有，归 06-site-adapters 处理"
+  - id: "Q6-ref-id-format"
+    question: "Ref ID 格式 `e1` (agent-browser parity) vs `[1]` vs `r1`?"
+    options: ["e1 (agent-browser parity)", "[1]", "r1"]
+    lock_before: "plan-milestones"
+    recommendation: "e1 — 跟 agent-browser 一致便于人脑切换工具 + 借鉴它的 prompt example"
+anchors:
+  - file: "src/career/applier/runtime/snapshot.mjs"
+    description: "m1: ~220 LOC. LLM-facing snapshot serializer via CDP Accessibility.getFullAXTree (Playwright v1.50+ removed page.accessibility — verified). INTERACTIVE_ROLES allowlist of 9 roles (Q2: heading kept). normalizeName() strips Unicode control + zero-width chars (M2 fix) applied to BOTH display and storage so getByRole matches. serializeNode() emits one-line `- role 'name' [ref=eN] [state?]` with [truncated] marker for names >80 chars (C1 fix). Per-CDPSession Accessibility.enable via WeakSet (H4 fix — was Page-keyed, wrong scope). Per-Page CDPSession cache evicts on page.on('close') (H3 fix). 15s SNAPSHOT_TIMEOUT race on getFullAXTree (M3 fix). EMITTED_STATES = ['required', 'checked', 'selected', 'expanded', 'disabled']. Occurrence-index per (role, name) pair for disambiguation (Q8)."
+  - file: "src/career/applier/runtime/refTable.mjs"
+    description: "m1: ~100 LOC. RefTable class — per-Page snapshot generation, monotonic eN counter. Constructor takes Page reference for cross-page misuse detection (M5 fix — resolve() throws WRONG_PAGE if called with foreign page). mint(role, name, occurrenceIndex, frameIdx=0) returns 'eN'; resolve() returns page.getByRole(role, { name, exact:true }).nth(occurrenceIndex). m2 will add generation counter for STALE_REF support and replace plain Error with SnapshotError class. frameIdx parameter present but unused in m1 (m2 will wire it for iframe inline-recurse)."
+  - file: "src/career/applier/runtime/actions.mjs"
+    description: "m1: ~70 LOC. Symbolic action API — only verbs LLM-facing tool surface exposes (per C1 constraint: raw page.locator/eval MUST NOT leak). m1 ships click + fill via locator.click({timeout}) / locator.fill({timeout}). Default 10s timeout (Q3), per-action override accepted via opts. Errors wrapped with refId + JSON.stringify'd name (L1 fix — was raw quotes, could break on names with embedded \"). m2 will replace plain Error with unified SnapshotError codes (ACTION_TIMEOUT / ELEMENT_GONE etc) and add pessimistic invalidation. m3 adds select/press/upload."
+  - file: "scripts/smoke-snapshot-core.mjs"
+    description: "m1 smoke: ~280 LOC, 12 asserts (up from 9 after review fixes). 1=allowlist 9 roles, 2=text contract + role coverage minimums + inferred-role lock for textbox (H1+H6 fixes), 3=non-interactive filter, 4=[required] state suffix, 5=click @submit fires onclick, 6=fill @email sets value, 7=UNKNOWN_REF on bad ref (m2: now SnapshotError code), 8=duplicate role+name → distinct refs + occurrenceIndex 0/1, 9=tight byte budget <800 (H2 fix — was 3200), 10=multi-page snapshot independence (M4 fix), 11=WRONG_PAGE cross-page misuse (M5 fix), 12=[truncated] marker on names >80 chars (C1 fix). Pure-Node SMOKE=1; fixture isolation backs up real .playwright/profile."
+  - file: "src/career/applier/runtime/errors.mjs"
+    description: "m2: ~145 LOC NEW. SnapshotError class + SNAPSHOT_ERROR_CODES enum + classifyPlaywrightError mapper. 6 codes: STALE_REF / UNKNOWN_REF / ELEMENT_GONE / ACTION_TIMEOUT / IFRAME_DETACHED / WRONG_PAGE. Each error carries code/refId/entry/hint/cause + toLLMMessage() for single-line LLM consumption. Static factories enforce code/message/hint coherence: staleRef(refId, entry, mintedGen, currentGen), unknownRef(refId), elementGone(refId, entry, cause), actionTimeout(refId, entry, action, timeoutMs, cause), iframeDetached(refId, entry), wrongPage(). classifyPlaywrightError maps Playwright errors via: detached/zero-elements/closed/strict-mode BEFORE timeout patterns (M3 fix — was timeout-first, causing detached elements to misclassify as ACTION_TIMEOUT); H2 fix added IFRAME_DETACHED + execution-context-destroyed + not-visible/stable/enabled/viewport/pointer-intercept patterns."
+  - file: "src/career/applier/runtime/refTable.mjs (m2 delta)"
+    description: "m2: ~+50 LOC. Added _currentGen counter (starts 0) + _mintedGen Map(refId → gen). mint() records current gen; invalidate() bumps current gen; resolve() throws SnapshotError.staleRef on gen mismatch. m1's plain Error throws replaced with SnapshotError instances (UNKNOWN_REF/WRONG_PAGE/IFRAME_DETACHED). entry.frame from m1 now CHECKED in resolve via frame.isDetached() → IFRAME_DETACHED error. Public iterators entries() and refIds() (M4 fix — was accessing _entries directly in smoke). entry.frame=null routes via page.getByRole; entry.frame=Frame routes via frame.getByRole."
+  - file: "src/career/applier/runtime/snapshot.mjs (m2 delta)"
+    description: "m2: ~+80 LOC for iframe inline-recurse. _walkPlaywrightFrames DFS (Frame objects in tree-order) + _walkCdpFrameTree DFS (CDP frame ids in tree-order) executed in parallel; per-frame loop calls Accessibility.getFullAXTree({frameId}) — empty args for top frame, frameId-scoped for iframes. URL sanity check on the parallel zip (H1 fix) — skip frame if pwFrame.url() !== cdpFrame.url to guard against mid-snapshot attach/detach races. Per-iframe try/catch — cross-origin iframe failures silently skipped (snapshot returns partial result vs total fail). Per-frame occurrenceCounts (Map fresh per iframe scope) so getByRole.nth() indices align with frame-scoped match counts not global. Dropped unnecessary cdp.send('Page.enable') (M1 fix — Page.getFrameTree works without it)."
+  - file: "src/career/applier/runtime/actions.mjs (m2 delta)"
+    description: "m2: ~+45 LOC. Introduced _runAction internal helper: resolve outside the action try (so resolve errors don't trigger invalidation per C1 review); inner try/catch/finally where catch routes via classifyPlaywrightError → SnapshotError.actionTimeout/elementGone + finally invalidates table (C3 pessimistic — fires whether action succeeded OR failed, since failure could mean DOM mutated mid-action). m1's manual error wrapping replaced with classifier. Removed dead try-catch-throw wrapper (C1+L3 fix — was structurally unobvious to future refactors)."
+  - file: "scripts/smoke-snapshot-invalidation.mjs"
+    description: "m2 smoke: ~290 LOC, 10 asserts (M5 added IFRAME_DETACHED test). 1=RefTable generation 0→N via invalidate, 2=post-click invalidation marks remaining refs STALE_REF with entry carried for debug, 3=fill also invalidates, 4=UNKNOWN_REF on never-minted refs, 5=ELEMENT_GONE on DOM-removed elements (accepts ACTION_TIMEOUT hedge for Playwright nondeterminism), 6=classifyPlaywrightError unit cases (TimeoutError/target-closed/zero-elements/unknown→null), 7=iframe inline-recurse (outer + iframe content in one snapshot, frame attached to iframe refs, null for top), 8=iframe action routing (click @inner-ref fires iframe-scoped click), 8b NEW=IFRAME_DETACHED on iframe removed between snapshot+resolve (M5 fix), 9=SnapshotError.toLLMMessage single-line format with code+refId+hint. Explicit iframe wait via waitFor + waitForLoadState (M2 fix — was waitForTimeout(300) flaky)."
+  - file: "src/career/applier/runtime/actions.mjs (m3 delta)"
+    description: "m3: ~+120 LOC. 3 new symbolic action verbs: select(page, refTable, refId, option, opts?) accepts string (label match), {label}, {value}, {index} variants (C2 fix — was label-only); press(page, refTable, refId, key, opts?) requires key in 14-element ALLOWED_KEYS whitelist (Enter/Tab/Escape/Arrow*/Backspace/Delete/Space/Home/End/PageUp/PageDown — locks LLM out of browser-shortcut combos); upload(page, refTable, refId, filePath, opts?) requires absolute path + existing regular file + ref-existence check FIRST (M5 fix — was running fs.stat on unknown refs producing misleading 'file not accessible' instead of UNKNOWN_REF). select role-mismatch check uses explicit precedence: entry exists + wrong role → ROLE_MISMATCH; entry undefined → fall through to resolve() for UNKNOWN_REF (H2 fix locks this behavior with a smoke test). All 3 new error codes via SnapshotError factories: roleMismatch/keyNotAllowed/uploadFailed (H1 fix — was inline new SnapshotError({...}) construction at 5 call sites with drift risk). Caller errors (ROLE_MISMATCH/KEY_NOT_ALLOWED/UPLOAD_FAILED/UNKNOWN_REF) thrown BEFORE _runAction so they don't invalidate the table; action-time failures still invalidate via _runAction's finally."
+  - file: "src/career/applier/runtime/elementScreenshot.mjs"
+    description: "m3: ~95 LOC NEW. captureElement(page, refTable, refId, jobId, label?) — JPEG q70 element-bounded crop via locator.screenshot, written to data/career/.playwright/screenshots/{jobId}/element-{eN}-{label}.jpg (distinct prefix from 02's full-page captureStep). Complements 02 by providing tight evidence crops for self-iteration/02-data-flywheel + 03-iteration-dashboard. Validates jobId as 12-hex + label as /^[a-z0-9-]{1,40}$/. Routes Playwright errors via classifyPlaywrightError (M3 fix — was bare ELEMENT_GONE with misleading 'element detached' hint regardless of root cause; now ELEMENT_GONE/ACTION_TIMEOUT/raw re-throw for disk/permissions). resolve() throws SnapshotError directly on bad ref / stale / wrong-page / iframe-detached."
+  - file: "src/career/applier/runtime/errors.mjs (m3 delta)"
+    description: "m3: ~+50 LOC. Added 3 enum codes (ROLE_MISMATCH/KEY_NOT_ALLOWED/UPLOAD_FAILED) + 3 static factories (roleMismatch(refId,entry,requiredRole,verb), keyNotAllowed(refId,key,allowedKeys), uploadFailed(refId,filePath,reason,cause)) per H1 fix from review. Maintains pre-existing 6-code factories; total 9 codes + 9 factories for full coverage of caller errors + action-time failures."
+  - file: "scripts/smoke-snapshot-integration.mjs"
+    description: "m3 smoke: ~325 LOC, 9 asserts integration-style. 1=select label/value/index variants round-trip (C2 verification), 2=ROLE_MISMATCH for wrong role + UNKNOWN_REF for missing ref (H2 precedence lock), 3=press Enter keydown + generation bump (M7 fix), 4=KEY_NOT_ALLOWED for 4 bad keys + hint lists allowed keys (M1 fix), 5=upload file path round-trips via setInputFiles, 6=upload validation 4 paths (relative/missing/directory M6 fix/unknown-ref M5 fix), 7=captureElement JPEG SOF0 marker parsed to verify cropped width/height NOT viewport-sized (H4 fix — was just size<10KB), 8=8-cycle handle-leak verification with c7 vs c1 latency comparison + absolute 3s cap + external memory delta <10MB (H3 fix — was loose 2.5x first-vs-second-half bound), 9=end-to-end fill+select+upload+click with submit-notify INSIDE the HTML (C1 fix — was broken encodeURIComponent append) + submitFired assertion + generation bumps verified at each step. Fixture isolation backs up USER_DATA_DIR + SCREENSHOTS_DIR + TMP_UPLOAD with pid suffix."
+created_at: "2026-05-11"
+updated_at: "2026-05-12"

@@ -1,0 +1,12 @@
+milestones: []
+current_sprint: "Sprint 2 — Profile (+ 05-pdf-import planning)"
+blockers: []
+completion: 80  # avg(100, 100, 100, 100, 0) — 05-pdf-import added 2026-05-19, planning only
+children_completion:
+  "01-identity": 100  # ✅ active
+  "02-preferences": 100  # ✅ active
+  "03-narrative-proof": 100  # ✅ active
+  "04-qa-bank": 100  # ✅ active — ROOM COMPLETE
+  "05-pdf-import": 0  # 🔄 planning (created 2026-05-19, no milestones locked yet)
+status_note: "Sprint 2 core DONE (4/4 features ✅). 05-pdf-import added 2026-05-19 in planning state — UX follow-up to find-jobs-redesign m1: drop a resume PDF into Settings → Identity, Claude Haiku parses fields, diff modal lets user review per-field before write. 7 OQs in spec await plan-milestones lock; 3 milestones estimated (~600 LOC). Implementation deferred — this commit lands planning artifacts only."
+last_updated: "2026-05-19"

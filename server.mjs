@@ -1,0 +1,6281 @@
+// Load .env (ANTHROPIC_API_KEY, GITHUB_TOKEN, etc.) before anything reads
+// process.env. Silent if no .env file exists — env may be set in the shell.
+try {
+  process.loadEnvFile();
+} catch {
+  // no .env file — fine, fall back to shell-exported vars
+}
+
+// Route Node's built-in fetch through an HTTP(S) proxy when one is set in
+// the environment. Node's undici-backed fetch ignores HTTP_PROXY by default
+// (unlike curl), which silently breaks every external call (Google OAuth,
+// GitHub API, Anthropic SDK) on networks that can only reach external
+// hosts through a local proxy. Opt-in via env so dev/prod without proxies
+// stay direct. NO_PROXY isn't honored — keep the proxy you set scoped or
+// configure it to passthrough loopback itself.
+import { setGlobalDispatcher, ProxyAgent } from 'undici';
+const OUTBOUND_PROXY = process.env.HTTPS_PROXY || process.env.https_proxy
+  || process.env.HTTP_PROXY || process.env.http_proxy;
+if (OUTBOUND_PROXY) {
+  setGlobalDispatcher(new ProxyAgent(OUTBOUND_PROXY));
+  console.log(`[server] outbound fetch routed via ${OUTBOUND_PROXY}`);
+}
+
+import express from 'express';
+import cors from 'cors';
+import fs from 'fs/promises';
+import { existsSync, mkdirSync, writeFileSync, createReadStream } from 'fs';
+import { createInterface } from 'readline';
+import { execSync } from 'child_process';
+import { randomBytes } from 'crypto';
+import path from 'path';
+import os from 'os';
+import { z } from 'zod';
+import yaml from 'js-yaml';
+import { markdownToTemplateHtml, ALLOWED_TAGS } from './src/career/lib/markdownToTemplateHtml.mjs';
+import { htmlToPdf, shutdownBrowser } from './src/career/lib/htmlToPdf.mjs';
+import { composeCvHtml } from './src/career/lib/cvTemplate.mjs';
+import {
+  buildGoogleOAuthUrl,
+  exchangeGoogleAuthCode,
+  exportGoogleDocAsMarkdown,
+  normalizeGoogleDocId,
+  refreshGoogleAccessToken,
+} from './src/career/lib/googleDocs.mjs';
+import {
+  startScan,
+  getScanStatus,
+  ScanAlreadyRunningError,
+  PIPELINE_FILE,
+  acquirePipelineEnrichLock,
+  releasePipelineEnrichLock,
+} from './src/career/finder/scanRunner.mjs';
+import { previewHardFilter } from './src/career/finder/dryRun.mjs';
+import { enrichBatch } from './src/career/finder/jdEnrich.mjs';
+import { shouldEnrich } from './src/career/finder/atsByUrl.mjs';
+import { startScheduler, stopScheduler } from './src/career/finder/scheduler.mjs';
+import { MODEL_PRICING, computeCostUsd } from './src/career/lib/anthropicPricing.mjs';
+import { evaluateJobsStageA } from './src/career/evaluator/stageARunner.mjs';
+import { evaluateJobsStageB } from './src/career/evaluator/stageBRunner.mjs';
+import { tailorOneJob, STATUS as TAILOR_STATUS } from './src/career/cv/tailorRunner.mjs';
+import {
+  readCadenceState,
+  cadenceToMs,
+} from './src/career/finder/cadenceState.mjs';
+import { SOURCE_TYPES } from './src/career/lib/jobSchema.mjs';
+import {
+  readPortalsConfig,
+  writePortalsConfig,
+} from './src/career/finder/portalsLoader.mjs';
+import { manualPaste } from './src/career/finder/adapters/manual.mjs';
+import {
+  readApplications,
+  transitionStatus,
+  appendTimelineEvent,
+  acquireApplicationsLock,
+  releaseApplicationsLock,
+  STATUS_VALUES,
+  TIMELINE_EVENT_TYPES,
+  APPLICATION_ID_RE,
+  InvalidTransitionError,
+  ApplicationNotFoundError,
+  TimelineOrderError,
+} from './src/career/applications/store.mjs';
+import {
+  readDraft,
+  writeDraft,
+  JOB_ID_RE as DRAFT_JOB_ID_RE,
+} from './src/career/applier/draftsStore.mjs';
+import { generateDraft, STATUS as DRAFT_STATUS } from './src/career/applier/draftRunner.mjs';
+import { loadApplierBundle } from './src/career/applier/applierBundle.mjs';
+import {
+  StartBodySchema as MultiStepStartBodySchema,
+  ApproveStepBodySchema as MultiStepApproveBodySchema,
+  ResumeBodySchema as MultiStepResumeBodySchema,
+  startMachine as multiStepStart,
+  approveStep as multiStepApproveStep,
+  pauseMachine as multiStepPause,
+  resumeMachine as multiStepResume,
+  getStatus as multiStepGetStatus,
+  // m7: user-driven escalation route (post-fill-handoff-ux §4.5/4.6)
+  cancelMachine as multiStepCancel,
+  // m9: per-field UI actions (post-fill-handoff-ux §4.3 — focus/retry/skip)
+  focusField as multiStepFocusField,
+  retryField as multiStepRetryField,
+  skipField as multiStepSkipField,
+  FieldActionBodySchema,
+  RetryFieldBodySchema,
+  // m11: Phase 4 recovery actions
+  recoverResumeCompress as multiStepRecoverResumeCompress,
+  recoverAltFormats as multiStepRecoverAltFormats,
+  recoverIdentifyAts as multiStepRecoverIdentifyAts,
+  recoverUserHint as multiStepRecoverUserHint,
+  RecoverResumeCompressBodySchema,
+  RecoverAltFormatsBodySchema,
+  RecoverIdentifyAtsBodySchema,
+  RecoverUserHintBodySchema,
+} from './src/career/applier/multistep/endpoint.mjs';
+// m9: SSE event hub — broadcast observer/state events to the Apply.tsx UI.
+import { subscribe as sseSubscribe, broadcast as sseBroadcast } from './src/career/applier/multistep/sseHub.mjs';
+import { JOB_ID_RE as APPLY_SESSIONS_JOB_ID_RE } from './src/career/applier/multistep/applySessionsStore.mjs';
+// 07-applier/07-self-iteration/02-data-flywheel m3 — approve/reject seam
+// for Haiku-induced proposals. Importing this module runs its top-level
+// await of ensureLearnedRulesLoaded, which wires user-approved classifier
+// rules into the live classifier at boot via 06's registerExtraRules seam.
+import {
+  approveSuggestion as feedbackApproveSuggestion,
+  rejectSuggestion as feedbackRejectSuggestion,
+} from './src/career/feedback/applySuggestion.mjs';
+import {
+  listSuggestions as feedbackListSuggestions,
+  readSuggestion as feedbackReadSuggestion,
+} from './src/career/feedback/suggestionStore.mjs';
+import {
+  FEEDBACK_DIR as FEEDBACK_DIR_PATH,
+  readJsonl as feedbackReadJsonl,
+  _FILES as FEEDBACK_FILES,
+} from './src/career/feedback/stores.mjs';
+
+const __dirname = path.dirname(new URL(import.meta.url).pathname);
+const app = express();
+app.use(cors());
+// Default 10MB for tracker/learn endpoints; career endpoints get a stricter cap
+// applied per-route below (256KB — config-shaped data, not bulk payloads).
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/career/')) {
+    return express.json({ limit: '256kb' })(req, res, next);
+  }
+  return express.json({ limit: '10mb' })(req, res, next);
+});
+
+// Data files
+const DATA_DIR = path.join(__dirname, 'data');
+const REPOS_FILE = path.join(DATA_DIR, 'repos.json');
+const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
+const COMMIT_STATS_FILE = path.join(DATA_DIR, 'commit-stats.json');
+const PR_STATS_FILE = path.join(DATA_DIR, 'pr-stats.json');
+
+// Career system data
+const CAREER_DIR = path.join(DATA_DIR, 'career');
+const LLM_COSTS_FILE = path.join(CAREER_DIR, 'llm-costs.jsonl');
+const IDENTITY_FILE = path.join(CAREER_DIR, 'identity.yml');
+const PREFERENCES_FILE = path.join(CAREER_DIR, 'preferences.yml');
+const NARRATIVE_FILE = path.join(CAREER_DIR, 'narrative.md');
+const PROOF_POINTS_FILE = path.join(CAREER_DIR, 'proof-points.md');
+const QA_BANK_DIR = path.join(CAREER_DIR, 'qa-bank');
+const QA_LEGAL_FILE = path.join(QA_BANK_DIR, 'legal.yml');
+const QA_TEMPLATES_FILE = path.join(QA_BANK_DIR, 'templates.md');
+const QA_HISTORY_FILE = path.join(QA_BANK_DIR, 'history.jsonl');
+const RESUMES_DIR = path.join(CAREER_DIR, 'resumes');
+const RESUMES_INDEX_FILE = path.join(RESUMES_DIR, 'index.yml');
+const CAREER_OAUTH_FILE = path.join(CAREER_DIR, '.oauth.json');
+
+if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+if (!existsSync(REPOS_FILE)) writeFileSync(REPOS_FILE, '[]');
+if (!existsSync(CONFIG_FILE)) writeFileSync(CONFIG_FILE, '{}');
+if (!existsSync(COMMIT_STATS_FILE)) writeFileSync(COMMIT_STATS_FILE, '{}');
+if (!existsSync(PR_STATS_FILE)) writeFileSync(PR_STATS_FILE, '{}');
+if (!existsSync(CAREER_DIR)) mkdirSync(CAREER_DIR, { recursive: true });
+if (!existsSync(LLM_COSTS_FILE)) writeFileSync(LLM_COSTS_FILE, '');
+if (!existsSync(QA_BANK_DIR)) mkdirSync(QA_BANK_DIR, { recursive: true });
+if (!existsSync(RESUMES_DIR)) mkdirSync(RESUMES_DIR, { recursive: true });
+if (!existsSync(QA_HISTORY_FILE)) writeFileSync(QA_HISTORY_FILE, '');
+
+// Helpers
+async function readJSON(file) { return JSON.parse(await fs.readFile(file, 'utf-8')); }
+
+// Atomic write: tempfile + rename. POSIX-atomic on same filesystem so a crash
+// mid-write leaves the original file intact rather than half-written garbage
+// that fails to parse on next boot.
+async function atomicWriteFile(file, content) {
+  const tmp = `${file}.tmp.${process.pid}.${Date.now()}`;
+  try {
+    await fs.writeFile(tmp, content);
+    await fs.rename(tmp, file);
+  } catch (e) {
+    fs.unlink(tmp).catch(() => {}); // tmp may not exist if writeFile failed early
+    throw e;
+  }
+}
+async function writeJSON(file, data) { await atomicWriteFile(file, JSON.stringify(data, null, 2)); }
+
+// 09-integrations-credentials m1: mask a secret for safe GET display.
+// Keep last 4 chars visible (helps the operator confirm they edited the
+// right key); everything else becomes a fixed-width dot run so the masked
+// length doesn't leak the true length of short keys. Strings under 8
+// chars fall back to a fully-opaque ●●●● — no characters revealed —
+// because revealing any of a short key gives away too much.
+function maskSecret(value, lastN = 4) {
+  if (typeof value !== 'string' || value.length === 0) return undefined;
+  if (value.length < 8) return '●●●●';
+  return '●●●●●●●●' + value.slice(-lastN);
+}
+
+// Deep-merge: defaults provide structure for any keys missing in `loaded`.
+// Plain-object values are merged recursively; arrays and primitives in `loaded`
+// replace defaults wholesale (so an explicit empty array from yaml stays empty).
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
+}
+function deepMerge(defaults, loaded) {
+  if (!isPlainObject(loaded)) return loaded === undefined ? defaults : loaded;
+  if (!isPlainObject(defaults)) return loaded;
+  const out = { ...defaults };
+  for (const k of Object.keys(loaded)) {
+    out[k] = isPlainObject(defaults[k]) && isPlainObject(loaded[k])
+      ? deepMerge(defaults[k], loaded[k])
+      : loaded[k];
+  }
+  return out;
+}
+
+// In-memory write-through caches for stats (persist across requests without re-reading file)
+let _commitStats = null;
+let _prStats = null;
+
+async function getCommitStats() {
+  if (!_commitStats) _commitStats = await readJSON(COMMIT_STATS_FILE).catch(() => ({}));
+  return _commitStats;
+}
+
+async function getPRStats() {
+  if (!_prStats) _prStats = await readJSON(PR_STATS_FILE).catch(() => ({}));
+  return _prStats;
+}
+
+// Concurrency-limited map: runs fn on each item with at most `limit` in parallel
+async function pLimit(items, fn, limit = 5) {
+  const results = new Array(items.length);
+  let idx = 0;
+  async function worker() {
+    while (idx < items.length) {
+      const i = idx++;
+      try { results[i] = await fn(items[i]); } catch { results[i] = null; }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+function parseGitHubUrl(url) {
+  const m = url.match(/github\.com\/([^/]+)\/([^/\s?#]+)/);
+  return m ? { owner: m[1], repo: m[2].replace(/\.git$/, '') } : null;
+}
+
+// Persistent disk-backed cache with 1-hour TTL
+const CACHE_FILE = path.join(DATA_DIR, 'github-cache.json');
+const CACHE_TTL = 60 * 60 * 1000; // 1 hour
+let cache = new Map();
+
+// Load cache from disk on startup
+try {
+  if (existsSync(CACHE_FILE)) {
+    const entries = JSON.parse(await fs.readFile(CACHE_FILE, 'utf-8'));
+    const now = Date.now();
+    for (const [key, val] of entries) {
+      if (now - val.time < CACHE_TTL) cache.set(key, val);
+    }
+  }
+} catch { /* start fresh */ }
+
+let cacheWritePending = false;
+function scheduleCacheWrite() {
+  if (cacheWritePending) return;
+  cacheWritePending = true;
+  setTimeout(async () => {
+    cacheWritePending = false;
+    try { await fs.writeFile(CACHE_FILE, JSON.stringify([...cache])); } catch { /* ignore */ }
+  }, 2000);
+}
+
+// Sweep expired cache entries every 30 min
+// [Euka] Disabled: GitHub-cache sweep belongs to the Tracker app, which is
+// not part of the standalone career system. The /api/repos|activity|prs
+// routes remain in this file as dormant dead code (see README).
+// setInterval(() => {
+//   const now = Date.now();
+//   let swept = false;
+//   for (const [key, val] of cache) {
+//     if (now - val.time >= CACHE_TTL) { cache.delete(key); swept = true; }
+//   }
+//   if (swept) scheduleCacheWrite();
+// }, 30 * 60 * 1000);
+
+// Cap persistent stats caches to prevent unbounded file growth
+const MAX_STATS_ENTRIES = 10000;
+function trimStatsCache(obj) {
+  const keys = Object.keys(obj);
+  if (keys.length <= MAX_STATS_ENTRIES) return obj;
+  const keep = keys.slice(-Math.floor(MAX_STATS_ENTRIES / 2));
+  const trimmed = {};
+  for (const k of keep) trimmed[k] = obj[k];
+  return trimmed;
+}
+
+async function githubFetch(endpoint) {
+  const cached = cache.get(endpoint);
+  if (cached && Date.now() - cached.time < CACHE_TTL) return cached.data;
+  if (cached) cache.delete(endpoint); // evict expired entry
+
+  const config = await readJSON(CONFIG_FILE);
+  const token = process.env.GITHUB_TOKEN || config.githubToken;
+  const headers = { Accept: 'application/vnd.github.v3+json', 'User-Agent': 'work-tracker' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  let res = await fetch(`https://api.github.com${endpoint}`, { headers });
+
+  // Retry once on secondary rate limit (403 with Retry-After)
+  if (res.status === 403 || res.status === 429) {
+    const retryAfter = parseInt(res.headers.get('retry-after') || '5', 10);
+    const wait = Math.min(retryAfter, 60) * 1000;
+    await new Promise(r => setTimeout(r, wait));
+    res = await fetch(`https://api.github.com${endpoint}`, { headers });
+  }
+
+  if (res.status === 409) return []; // empty repo
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub ${res.status}: ${text.slice(0, 200)}`);
+  }
+
+  const data = await res.json();
+  cache.set(endpoint, { data, time: Date.now() });
+  scheduleCacheWrite();
+  return data;
+}
+
+// --- Config ---
+//
+// 09-integrations-credentials m1 extends this endpoint:
+//   - GET response keeps the original {githubUsername, hasToken} for the
+//     TrackerApp's existing useConfig hook (don't break that) and adds
+//     nested {anthropic, google, github} shapes with masked values for
+//     the new /career/settings/integrations page.
+//   - PUT accepts anthropicApiKey / googleClientId / googleClientSecret
+//     in addition to the original github fields. Field semantics:
+//       undefined  → skip (no change)
+//       empty ''   → clear (delete from config.json)
+//       string     → set
+//     Non-string values for new credentials → 400 reject. The new "empty
+//     = clear" rule doesn't break TrackerApp because TrackerApp's existing
+//     form omits an empty token entirely (TrackerApp.tsx:874).
+//   - On anthropicApiKey change, invalidate the cached Anthropic client
+//     so the new key takes effect without restarting the server.
+app.get('/api/config', async (_req, res) => {
+  try {
+    const config = await readJSON(CONFIG_FILE);
+    const envToken = process.env.GITHUB_TOKEN;
+    res.json({
+      // Existing top-level fields (TrackerApp consumer). Don't change shape.
+      githubUsername: config.githubUsername || '',
+      hasToken: !!(envToken || config.githubToken),
+      // New Integrations-page shape. Each leaf is {set, masked?} — never
+      // ships the raw value to the client.
+      anthropic: maskedState(process.env.ANTHROPIC_API_KEY || config.anthropicApiKey),
+      google: {
+        clientId: maskedState(process.env.GOOGLE_CLIENT_ID || config.googleClientId),
+        clientSecret: maskedState(process.env.GOOGLE_CLIENT_SECRET || config.googleClientSecret),
+      },
+      github: {
+        username: config.githubUsername || '',
+        token: maskedState(envToken || config.githubToken),
+      },
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Helper local to the config endpoint — wraps a possibly-undefined secret
+// into the {set, masked?} shape the GET response uses.
+function maskedState(value) {
+  if (typeof value !== 'string' || value.length === 0) return { set: false };
+  return { set: true, masked: maskSecret(value) };
+}
+
+// Field whitelist for PUT — anything else in req.body is silently ignored.
+// Each value must be a string (empty string means "clear"; whitespace is
+// trimmed and treated as empty after trim).
+const CONFIG_PUT_FIELDS = Object.freeze([
+  'githubUsername',
+  'githubToken',
+  'anthropicApiKey',
+  'googleClientId',
+  'googleClientSecret',
+]);
+
+// REVIEW H2 (security): cap any single credential field. The default
+// express.json() limit upstream of this route is 10MB; a misbehaving or
+// malicious PUT of a 10MB string would persist into data/config.json
+// and force a hundreds-of-ms JSON.parse on every subsequent read.
+// 2KB is comfortably above the longest real credential (Google OAuth
+// secrets are ~24 chars, GitHub fine-grained tokens ~93, Anthropic keys
+// ~108) and well below the parse-cost cliff.
+const MAX_CREDENTIAL_LEN = 2048;
+
+// REVIEW H5 (Plan): the read-modify-write pattern in PUT isn't atomic
+// across concurrent requests — atomicWriteFile is per-file but two
+// PUTs that interleave (read, mutate, write) can lose one update.
+// Serialize all config writes through a single promise chain so a
+// burst from two clients (TrackerApp + Integrations page) can't drop
+// fields. Per-process only (the dashboard is single-process).
+let _configWriteChain = Promise.resolve();
+function serializeConfigWrite(task) {
+  const next = _configWriteChain.then(task, task);
+  _configWriteChain = next.catch(() => {});
+  return next;
+}
+
+// REVIEW H1 (security): the credentials write path is the new attack
+// surface this Room adds. The server still binds to 0.0.0.0 (broader
+// scope to change) and `cors()` is wide-open, so a malicious page in
+// the operator's browser could PUT a key the attacker controls and
+// the next getClient() would call Anthropic on the attacker's account.
+// Guard PUT specifically with an Origin/Host same-origin check. Direct
+// tools (curl, the smoke harness) don't send Origin and fall through
+// untouched; browsers always send it on cross-origin fetches.
+function isSameOriginWrite(req) {
+  const origin = req.get('origin');
+  if (!origin) return true; // non-browser caller (curl, smoke, fetch from node)
+  let parsed;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return false;
+  }
+  const host = req.get('host') || '';
+  if (parsed.host === host) return true;
+  // Dev: vite (5173) proxies /api to this server (4568) and rewrites the
+  // Host header to the backend, so Origin ≠ Host even though the browser
+  // is on the trusted dev frontend. Accept a configured allowlist instead
+  // of failing the legitimate same-tab save. Browser-controlled Origin is
+  // load-bearing here — non-browsers can spoof, but they can also hit
+  // the file directly, so the check only ever defends against CSRF.
+  const allowlist = (process.env.CAREER_ALLOWED_WRITE_ORIGINS || 'http://localhost:5173')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  return allowlist.includes(origin);
+}
+
+app.put('/api/config', async (req, res) => {
+  try {
+    if (!isSameOriginWrite(req)) {
+      return res.status(403).json({
+        error: 'cross-origin config write rejected (same-origin policy)',
+      });
+    }
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+      ? req.body
+      : {};
+    // Type-check + length-cap up front so we never write garbage to
+    // config.json — a misconfigured client sending `{anthropicApiKey:
+    // 12345}` or a 10MB string shouldn't silently coerce/persist.
+    // REVIEW H3 (Plan): trim leading/trailing whitespace before
+    // empty-check so `'   '` clears the field instead of writing
+    // whitespace that then breaks Anthropic SDK auth with a confusing
+    // 401 from a "set" key.
+    const normalized = {};
+    for (const field of CONFIG_PUT_FIELDS) {
+      if (body[field] === undefined) continue;
+      if (typeof body[field] !== 'string') {
+        return res.status(400).json({
+          error: `field ${field} must be a string ('' to clear); got ${typeof body[field]}`,
+        });
+      }
+      if (body[field].length > MAX_CREDENTIAL_LEN) {
+        return res.status(400).json({
+          error: `field ${field} exceeds ${MAX_CREDENTIAL_LEN} chars`,
+        });
+      }
+      normalized[field] = body[field].trim();
+    }
+    let anthropicChanged = false;
+    await serializeConfigWrite(async () => {
+      const existing = await readJSON(CONFIG_FILE);
+      const beforeAnthropic = existing.anthropicApiKey;
+      for (const field of CONFIG_PUT_FIELDS) {
+        if (!(field in normalized)) continue;
+        if (normalized[field] === '') delete existing[field];
+        else existing[field] = normalized[field];
+      }
+      await writeJSON(CONFIG_FILE, existing);
+      anthropicChanged = existing.anthropicApiKey !== beforeAnthropic;
+    });
+    cache.clear();
+    scheduleCacheWrite();
+    // If the Anthropic key materially changed, drop the cached client so
+    // the next getClient() rebuilds from the new env→config.json chain.
+    // Dynamic import so a server boot without anthropicClient on the hot
+    // path still works (the module pulls the SDK + spawn helpers).
+    // REVIEW H1 (edge): don't swallow the import error — log it. A
+    // silently-failed invalidation leaves the stale client in cache and
+    // the operator's new key won't take effect, with no log trail.
+    if (anthropicChanged) {
+      try {
+        const { _resetClientForTesting } = await import('./src/career/lib/anthropicClient.mjs');
+        _resetClientForTesting();
+      } catch (e) {
+        console.warn(
+          `[config] anthropic client cache invalidate failed; new key may not take effect until restart: ${e?.message ?? e}`,
+        );
+      }
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- 09-integrations-credentials m3: POST /api/career/config/:service/test ---
+//
+// Lightweight reachability test per service so the operator can verify
+// a saved credential actually works without leaving the Integrations
+// page. Each service uses the cheapest meaningful test:
+//
+//   anthropic — send 1-output-token to claude-haiku-4-5 (~$0.0001).
+//               Classifies AuthenticationError vs RateLimitError vs
+//               APIConnectionError vs other.
+//   google    — format-only check (clientId / clientSecret regex). The
+//               real OAuth handshake lives in Resumes → Sync; testing it
+//               here would require user interaction. No network call.
+//   github    — GET https://api.github.com/user with the token. Returns
+//               the authenticated login + scope list on success.
+//
+// Read credentials from env then config.json (same precedence as
+// elsewhere). NEVER echo the raw secret in the response — only metadata
+// (model, login, scopes, error class).
+
+const SERVICE_TEST_HANDLERS = Object.freeze({
+  anthropic: testAnthropic,
+  google: testGoogle,
+  github: testGithub,
+});
+
+app.post('/api/career/config/:service/test', async (req, res) => {
+  const { service } = req.params;
+  const handler = SERVICE_TEST_HANDLERS[service];
+  if (!handler) {
+    return res.status(404).json({ error: `unknown service '${service}'` });
+  }
+  try {
+    // Read fresh config each call — testing the value currently on disk,
+    // not whatever a cached SDK client was built with at boot.
+    const config = await readJSON(CONFIG_FILE).catch(() => ({}));
+    const result = await handler(config, req);
+    res.json(result);
+  } catch (e) {
+    // The handlers swallow their own service-specific errors and return
+    // {ok:false, reason}. A reach-here is an internal bug — surface it
+    // as 500 + message, never swallow.
+    res.status(500).json({ error: String(e?.message ?? e).slice(0, 300) });
+  }
+});
+
+const ANTHROPIC_TEST_TIMEOUT_MS = 20_000;
+const ANTHROPIC_TEST_MODEL = 'claude-haiku-4-5-20251001';
+
+async function testAnthropic(config, _req) {
+  // Route through anthropicClient.getClient() so the MOCK_ANTHROPIC=1
+  // and CAREER_LLM_BACKEND=cli envs work the same way they do in the
+  // rest of the system. We reset the cache first so a stale client
+  // (e.g. built from a since-replaced key) doesn't shadow the value
+  // currently on disk. The PUT path already does this, but a smoke /
+  // direct config edit wouldn't have.
+  let getClient, _resetClientForTesting, AuthenticationError, RateLimitError, APIConnectionError, ConfigError;
+  try {
+    ({
+      getClient,
+      _resetClientForTesting,
+      AuthenticationError,
+      RateLimitError,
+      APIConnectionError,
+      ConfigError,
+    } = await import('./src/career/lib/anthropicClient.mjs'));
+  } catch (e) {
+    return { ok: false, reason: 'other', detail: `anthropicClient import failed: ${e?.message ?? e}` };
+  }
+  // Short-circuit "unset" before touching the SDK so the operator gets a
+  // clear message instead of the generic ConfigError text.
+  if (
+    process.env.MOCK_ANTHROPIC !== '1'
+    && process.env.CAREER_LLM_BACKEND !== 'cli'
+    && !process.env.ANTHROPIC_API_KEY
+    && !config.anthropicApiKey
+  ) {
+    return { ok: false, reason: 'unset', detail: 'No Anthropic API key configured.' };
+  }
+  _resetClientForTesting();
+  let client;
+  try {
+    client = getClient();
+  } catch (e) {
+    if (ConfigError && e instanceof ConfigError) {
+      return { ok: false, reason: 'unset', detail: e.message };
+    }
+    return { ok: false, reason: 'other', detail: String(e?.message ?? e).slice(0, 200) };
+  }
+  const started = Date.now();
+  // REVIEW H2: clear the race timer when the ping wins, otherwise the
+  // setTimeout fires later and creates a detached rejected promise
+  // (Node 18+ surfaces these as unhandled rejections).
+  let timeoutId;
+  try {
+    const ping = client.messages.create({
+      model: ANTHROPIC_TEST_MODEL,
+      max_tokens: 1,
+      messages: [{ role: 'user', content: 'ok' }],
+    });
+    const timeout = new Promise((_, rej) => {
+      timeoutId = setTimeout(
+        () => rej(new Error('Anthropic ping timed out')),
+        ANTHROPIC_TEST_TIMEOUT_MS,
+      );
+    });
+    const resp = await Promise.race([ping, timeout]);
+    clearTimeout(timeoutId);
+    return {
+      ok: true,
+      model: ANTHROPIC_TEST_MODEL,
+      elapsed_ms: Date.now() - started,
+      stop_reason: resp?.stop_reason,
+    };
+  } catch (e) {
+    clearTimeout(timeoutId);
+    const elapsed_ms = Date.now() - started;
+    if (AuthenticationError && e instanceof AuthenticationError) {
+      return { ok: false, reason: 'auth', detail: 'API key was rejected (401).', elapsed_ms };
+    }
+    if (RateLimitError && e instanceof RateLimitError) {
+      return { ok: false, reason: 'rate_limit', detail: 'Rate limited by Anthropic (429).', elapsed_ms };
+    }
+    if (APIConnectionError && e instanceof APIConnectionError) {
+      return { ok: false, reason: 'network', detail: `Network error: ${e.message}`, elapsed_ms };
+    }
+    if (/timed out/i.test(e?.message ?? '')) {
+      return { ok: false, reason: 'network', detail: 'Ping timed out.', elapsed_ms };
+    }
+    return {
+      ok: false,
+      reason: 'other',
+      detail: String(e?.message ?? e).slice(0, 200),
+      elapsed_ms,
+    };
+  }
+}
+
+// Format-only validation — the real OAuth flow happens elsewhere. The
+// patterns mirror Google's documented client-credential shapes; a
+// mistype here will fail OAuth at the real-call site (Resumes → Sync)
+// with a less helpful error, so catching the format mismatch up front
+// is the operator-visible value.
+const GOOGLE_CLIENT_ID_RE = /^[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com$/;
+const GOOGLE_CLIENT_SECRET_RE = /^GOCSPX-[A-Za-z0-9_-]{15,}$/;
+
+async function testGoogle(config, _req) {
+  const clientId = process.env.GOOGLE_CLIENT_ID || config.googleClientId;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET || config.googleClientSecret;
+  if (!clientId && !clientSecret) {
+    return { ok: false, reason: 'unset', detail: 'No Google OAuth credentials configured.' };
+  }
+  // REVIEW H4: distinguish "set + valid", "set + invalid", and "unset".
+  // The UI's Test button enables on OR (either field present), so
+  // returning ok:false just because the other half is unset would
+  // mislead the operator who only filled in one. Compute ok over the
+  // SET-and-VALID fields only; report unset fields as informational.
+  const checkId = !clientId
+    ? { valid: null, reason: 'Not set' }
+    : GOOGLE_CLIENT_ID_RE.test(clientId)
+      ? { valid: true }
+      : { valid: false, reason: 'Must end in .apps.googleusercontent.com' };
+  const checkSecret = !clientSecret
+    ? { valid: null, reason: 'Not set' }
+    : GOOGLE_CLIENT_SECRET_RE.test(clientSecret)
+      ? { valid: true }
+      : { valid: false, reason: 'Must start with GOCSPX- (≥15 chars after)' };
+  // ok is true iff no set field is invalid (treating unset as neutral).
+  const ok = checkId.valid !== false && checkSecret.valid !== false;
+  return {
+    ok,
+    clientId: checkId,
+    clientSecret: checkSecret,
+    note: 'Format-only check; the real OAuth handshake runs from Resumes → Sync.',
+  };
+}
+
+const GITHUB_TEST_TIMEOUT_MS = 10_000;
+
+async function testGithub(config, _req) {
+  const token = process.env.GITHUB_TOKEN || config.githubToken;
+  if (!token) {
+    return { ok: false, reason: 'unset', detail: 'No GitHub token configured.' };
+  }
+  // Smoke uses MOCK_GITHUB_TEST to bypass the live network call. Token
+  // shape determines the canned response so we exercise both happy and
+  // auth-fail paths without touching api.github.com.
+  // REVIEW M5: gate on NODE_ENV !== 'production' so an accidentally-
+  // inherited env in a prod deployment can't silently mock real test
+  // results (violating "no silent errors").
+  if (process.env.MOCK_GITHUB_TEST === '1' && process.env.NODE_ENV !== 'production') {
+    if (token.startsWith('bad_')) {
+      return { ok: false, reason: 'auth', detail: 'Mocked 401 from api.github.com.' };
+    }
+    return { ok: true, login: 'mock-user', scopes: ['repo', 'read:user'] };
+  }
+  const started = Date.now();
+  // REVIEW M6: keep the AbortController alive through the body read so
+  // a slow / hung body stream can't outlive the timeout. Clear the
+  // timeout only after the JSON parse completes (or fails).
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), GITHUB_TEST_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch('https://api.github.com/user', {
+      headers: {
+        Accept: 'application/vnd.github.v3+json',
+        Authorization: `Bearer ${token}`,
+        'User-Agent': 'work-tracker',
+      },
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    clearTimeout(to);
+    return {
+      ok: false,
+      reason: 'network',
+      detail: `Network error: ${e?.message ?? e}`,
+      elapsed_ms: Date.now() - started,
+    };
+  }
+  const elapsed_ms = Date.now() - started;
+  if (res.status === 401) {
+    clearTimeout(to);
+    return { ok: false, reason: 'auth', detail: 'Token rejected (401).', elapsed_ms };
+  }
+  if (res.status === 403) {
+    // 403 from GitHub is usually rate-limit; the message body says which.
+    const text = await res.text().catch(() => '');
+    clearTimeout(to);
+    const isRateLimit = /rate limit/i.test(text);
+    return {
+      ok: false,
+      reason: isRateLimit ? 'rate_limit' : 'forbidden',
+      detail: text.slice(0, 200) || 'Forbidden (403).',
+      elapsed_ms,
+    };
+  }
+  if (!res.ok) {
+    clearTimeout(to);
+    return {
+      ok: false,
+      reason: 'other',
+      detail: `HTTP ${res.status}`,
+      elapsed_ms,
+    };
+  }
+  // REVIEW M7: a 200 response that fails to JSON-parse (e.g. GitHub
+  // serving an HTML maintenance page) must NOT silently look like a
+  // success with empty data. Surface as reason:'other'.
+  let data;
+  try {
+    data = await res.json();
+  } catch (e) {
+    clearTimeout(to);
+    return {
+      ok: false,
+      reason: 'other',
+      detail: `200 OK but response body was not valid JSON: ${e?.message ?? e}`,
+      elapsed_ms,
+    };
+  }
+  clearTimeout(to);
+  // X-OAuth-Scopes header lists the granted scopes — useful diagnostic
+  // for an operator wondering why a specific endpoint works in Tracker
+  // but not in (say) a private-repo path.
+  const scopesHeader = res.headers.get('x-oauth-scopes') || '';
+  const scopes = scopesHeader
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return {
+    ok: true,
+    login: data.login || null,
+    scopes,
+    elapsed_ms,
+  };
+}
+
+// --- Repos ---
+app.get('/api/repos', async (_req, res) => {
+  try { res.json(await readJSON(REPOS_FILE)); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/repos', async (req, res) => {
+  try {
+    const parsed = parseGitHubUrl(req.body.url);
+    if (!parsed) return res.status(400).json({ error: 'Invalid GitHub URL' });
+
+    const repos = await readJSON(REPOS_FILE);
+    const id = `${parsed.owner}/${parsed.repo}`;
+    if (repos.find(r => r.id === id)) return res.status(409).json({ error: 'Repo already tracked' });
+
+    const newRepo = { id, url: `https://github.com/${id}`, ...parsed, addedAt: new Date().toISOString() };
+    repos.push(newRepo);
+    await writeJSON(REPOS_FILE, repos);
+    res.json(newRepo);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Sync repos from recent commits (last 3 days) ---
+app.post('/api/repos/sync', async (req, res) => {
+  try {
+    const config = await readJSON(CONFIG_FILE);
+    const username = config.githubUsername;
+    if (!username) return res.status(400).json({ error: 'Set GitHub username in settings first' });
+
+    const since = new Date();
+    since.setDate(since.getDate() - 3);
+    const sinceStr = since.toISOString().slice(0, 10);
+    const q = encodeURIComponent(`author:${username} committer-date:>=${sinceStr}`);
+
+    // 1. Search public commits (max 2 pages = 200 results)
+    const repoMap = new Map();
+    for (let page = 1; page <= 2; page++) {
+      const data = await githubFetch(`/search/commits?q=${q}&per_page=100&page=${page}&sort=committer-date`);
+      if (!data.items || data.items.length === 0) break;
+      for (const item of data.items) {
+        const repo = item.repository;
+        if (repo && !repoMap.has(repo.full_name)) {
+          repoMap.set(repo.full_name, repo);
+        }
+      }
+      if (data.items.length < 100) break;
+    }
+
+    // 2. Private repos (1 extra request)
+    const privateRepos = await githubFetch('/user/repos?per_page=100&visibility=private&sort=pushed').catch(() => []);
+    if (Array.isArray(privateRepos)) {
+      const threeDaysAgo = since.toISOString();
+      for (const gh of privateRepos) {
+        if (gh.pushed_at && gh.pushed_at >= threeDaysAgo && !repoMap.has(gh.full_name)) {
+          repoMap.set(gh.full_name, gh);
+        }
+      }
+    }
+
+    const repos = await readJSON(REPOS_FILE);
+    const existingIds = new Set(repos.map(r => r.id));
+    let added = 0;
+
+    for (const [id, gh] of repoMap) {
+      if (existingIds.has(id)) continue;
+      repos.push({
+        id,
+        url: gh.html_url,
+        owner: gh.owner.login,
+        repo: gh.name,
+        addedAt: new Date().toISOString(),
+      });
+      added++;
+    }
+
+    await writeJSON(REPOS_FILE, repos);
+    res.json({ ok: true, added, total: repos.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/repos/:owner/:repo', async (req, res) => {
+  try {
+    const id = `${req.params.owner}/${req.params.repo}`;
+    const repos = (await readJSON(REPOS_FILE)).filter(r => r.id !== id);
+    await writeJSON(REPOS_FILE, repos);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Activity (all branches) ---
+app.get('/api/activity', async (req, res) => {
+  try {
+    const { since, until, author } = req.query;
+    const repos = await readJSON(REPOS_FILE);
+    if (repos.length === 0) return res.json({ activity: [], errors: [] });
+
+    const results = await Promise.allSettled(
+      repos.map(async (repo) => {
+        // Fetch all branches, then commits per branch, dedupe by sha
+        const branches = await githubFetch(`/repos/${repo.id}/branches?per_page=100`).catch(() => []);
+        const branchList = Array.isArray(branches) ? branches : [];
+
+        const commitsBySha = new Map(); // sha -> { commit, branches: Set }
+        await pLimit(branchList, async (br) => {
+          let endpoint = `/repos/${repo.id}/commits?per_page=100&sha=${encodeURIComponent(br.name)}`;
+          if (since) endpoint += `&since=${since}`;
+          if (until) endpoint += `&until=${until}`;
+          if (author) endpoint += `&author=${author}`;
+          const commits = await githubFetch(endpoint).catch(() => []);
+          for (const c of (Array.isArray(commits) ? commits : [])) {
+            if (!commitsBySha.has(c.sha)) commitsBySha.set(c.sha, { commit: c, branches: new Set() });
+            commitsBySha.get(c.sha).branches.add(br.name);
+          }
+        }, 5);
+
+        return {
+          repo: repo.id,
+          repoUrl: repo.url,
+          branches: branchList.map(b => b.name),
+          commits: [...commitsBySha.values()].map(({ commit: c, branches: brs }) => ({
+            sha: c.sha,
+            message: c.commit.message,
+            author: c.commit.author.name,
+            date: c.commit.committer.date,
+            url: c.html_url,
+            branch: [...brs].join(', '),
+          })),
+        };
+      })
+    );
+
+    const activity = [];
+    const errors = [];
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled') activity.push(r.value);
+      else errors.push({ repo: repos[i].id, error: r.reason?.message || 'Unknown error' });
+    });
+
+    // Enrich commits with line stats (from local cache; fetch uncached ones, cap at 50 per request)
+    const commitStats = await getCommitStats();
+    const toFetch = [];
+    for (const ra of activity) {
+      for (const c of ra.commits) {
+        if (!commitStats[c.sha]) {
+          toFetch.push({ repoId: ra.repo, sha: c.sha });
+          if (toFetch.length >= 50) break;
+        }
+      }
+      if (toFetch.length >= 50) break;
+    }
+    if (toFetch.length > 0) {
+      await pLimit(toFetch, async ({ repoId, sha }) => {
+        const data = await githubFetch(`/repos/${repoId}/commits/${sha}`).catch(() => null);
+        if (data?.stats) commitStats[sha] = { additions: data.stats.additions, deletions: data.stats.deletions };
+      }, 5);
+      _commitStats = trimStatsCache(commitStats);
+      writeJSON(COMMIT_STATS_FILE, _commitStats).catch(e => console.warn('stats cache write failed:', e.message));
+    }
+    for (const ra of activity) {
+      for (const c of ra.commits) {
+        const s = commitStats[c.sha];
+        if (s) { c.additions = s.additions; c.deletions = s.deletions; }
+      }
+    }
+
+    res.json({ activity, errors });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Pull Requests ---
+app.get('/api/prs', async (req, res) => {
+  try {
+    const { since, author } = req.query;
+    const repos = await readJSON(REPOS_FILE);
+    if (repos.length === 0) return res.json({ prs: [], errors: [] });
+
+    const results = await Promise.allSettled(
+      repos.map(async (repo) => {
+        // Fetch open + recently closed PRs
+        const [openPRs, closedPRs] = await Promise.all([
+          githubFetch(`/repos/${repo.id}/pulls?state=open&per_page=50&sort=updated&direction=desc`),
+          githubFetch(`/repos/${repo.id}/pulls?state=closed&per_page=50&sort=updated&direction=desc`),
+        ]);
+
+        const all = [...(Array.isArray(openPRs) ? openPRs : []), ...(Array.isArray(closedPRs) ? closedPRs : [])];
+
+        let filtered = all;
+        if (author) {
+          const a = author.toLowerCase();
+          filtered = filtered.filter(pr => pr.user?.login?.toLowerCase() === a);
+        }
+        if (since) {
+          const sinceDate = new Date(since);
+          filtered = filtered.filter(pr => new Date(pr.updated_at) >= sinceDate);
+        }
+
+        return {
+          repo: repo.id,
+          repoUrl: repo.url,
+          prs: filtered.map(pr => ({
+            number: pr.number,
+            title: pr.title,
+            state: pr.state,
+            merged: !!pr.merged_at,
+            author: pr.user?.login || '',
+            branch: pr.head?.ref || '',
+            baseBranch: pr.base?.ref || '',
+            createdAt: pr.created_at,
+            updatedAt: pr.updated_at,
+            mergedAt: pr.merged_at,
+            closedAt: pr.closed_at,
+            url: pr.html_url,
+            reviewComments: pr.review_comments,
+          })),
+        };
+      })
+    );
+
+    const prs = [];
+    const errors = [];
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled') prs.push(r.value);
+      else errors.push({ repo: repos[i].id, error: r.reason?.message || 'Unknown error' });
+    });
+
+    // Enrich PRs with line stats from local cache; fetch uncached ones
+    const prStats = await getPRStats();
+    const prToFetch = [];
+    for (const rp of prs) {
+      for (const pr of rp.prs) {
+        const key = `${rp.repo}#${pr.number}`;
+        if (!prStats[key]) {
+          prToFetch.push({ repoId: rp.repo, number: pr.number, key });
+          if (prToFetch.length >= 50) break;
+        }
+      }
+      if (prToFetch.length >= 50) break;
+    }
+    if (prToFetch.length > 0) {
+      await pLimit(prToFetch, async ({ repoId, number, key }) => {
+        const data = await githubFetch(`/repos/${repoId}/pulls/${number}`).catch(() => null);
+        if (data?.additions != null) prStats[key] = { additions: data.additions, deletions: data.deletions };
+      }, 5);
+      _prStats = trimStatsCache(prStats);
+      writeJSON(PR_STATS_FILE, _prStats).catch(e => console.warn('stats cache write failed:', e.message));
+    }
+    for (const rp of prs) {
+      for (const pr of rp.prs) {
+        const s = prStats[`${rp.repo}#${pr.number}`];
+        if (s) { pr.additions = s.additions; pr.deletions = s.deletions; }
+      }
+    }
+
+    res.json({ prs, errors });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Rate limit ---
+app.get('/api/rate-limit', async (_req, res) => {
+  try {
+    const data = await githubFetch('/rate_limit');
+    res.json(data.rate || data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// =====================
+// Learn Knowledge Base — Multi-directory support
+// =====================
+const LEARN_DIRS_FILE = path.join(DATA_DIR, 'learn-dirs.json');
+
+// Initialize learn-dirs.json as empty if missing — users add their own directories via the UI
+if (!existsSync(LEARN_DIRS_FILE)) {
+  writeFileSync(LEARN_DIRS_FILE, '[]');
+}
+
+async function getLearnDirs() {
+  const dirs = await readJSON(LEARN_DIRS_FILE);
+  return dirs.filter(d => existsSync(d.path));
+}
+
+function slugify(name) {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+}
+
+// Resolve a prefixed path like "learn/subfolder/file.md" → { dirPath, relativePath }
+async function resolvePath(prefixedPath) {
+  const dirs = await getLearnDirs();
+  const firstSlash = prefixedPath.indexOf('/');
+  const dirId = firstSlash === -1 ? prefixedPath : prefixedPath.slice(0, firstSlash);
+  const rel = firstSlash === -1 ? '' : prefixedPath.slice(firstSlash + 1);
+  const dir = dirs.find(d => d.id === dirId);
+  if (!dir) throw new Error(`Unknown directory: ${dirId}`);
+  const fullPath = rel ? path.join(dir.path, rel) : dir.path;
+  if (fullPath !== dir.path && !fullPath.startsWith(dir.path + '/')) throw new Error('Path traversal');
+  return { dir, fullPath, rel, dirId };
+}
+
+async function buildTree(dirPath, relativePath, ignoreList = []) {
+  const entries = await fs.readdir(dirPath, { withFileTypes: true });
+  const children = [];
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (entry.name.startsWith('.') || entry.name === 'node_modules' || ignoreList.includes(entry.name)) continue;
+    const rel = relativePath ? path.join(relativePath, entry.name) : entry.name;
+    if (entry.isDirectory()) {
+      const sub = await buildTree(path.join(dirPath, entry.name), rel);
+      children.push({ name: entry.name, path: rel, type: 'dir', children: sub });
+    } else if (entry.name.endsWith('.md')) {
+      children.push({ name: entry.name, path: rel, type: 'file' });
+    }
+  }
+  return children;
+}
+
+// --- Folder Picker (native macOS dialog) ---
+app.post('/api/pick-folder', async (_req, res) => {
+  try {
+    const { exec } = await import('child_process');
+    const script = `osascript -e 'POSIX path of (choose folder with prompt "Choose a folder to add")'`;
+    exec(script, { encoding: 'utf-8', timeout: 120000 }, (err, stdout) => {
+      if (err) {
+        // User cancelled or error — status 1 means cancel
+        return res.json({ cancelled: true });
+      }
+      const result = stdout.trim();
+      const folder = result.endsWith('/') ? result.slice(0, -1) : result;
+      res.json({ path: folder, name: path.basename(folder) });
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Learn Dirs CRUD ---
+app.get('/api/learn-dirs', async (_req, res) => {
+  try { res.json(await getLearnDirs()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/learn-dirs', async (req, res) => {
+  try {
+    const { name, path: dirPath } = req.body;
+    if (!name || !dirPath) return res.status(400).json({ error: 'name and path required' });
+    const resolved = path.resolve(dirPath.replace(/^~/, os.homedir()));
+    if (!existsSync(resolved)) return res.status(400).json({ error: 'Directory does not exist' });
+    const dirs = await readJSON(LEARN_DIRS_FILE);
+    const id = slugify(name);
+    if (dirs.find(d => d.id === id)) return res.status(409).json({ error: 'A directory with this name already exists' });
+    if (dirs.find(d => d.path === resolved)) return res.status(409).json({ error: 'This directory is already added' });
+    dirs.push({ id, name, path: resolved });
+    await writeJSON(LEARN_DIRS_FILE, dirs);
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/learn-dirs/:id', async (req, res) => {
+  try {
+    const dirs = (await readJSON(LEARN_DIRS_FILE)).filter(d => d.id !== req.params.id);
+    await writeJSON(LEARN_DIRS_FILE, dirs);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Prefix children paths with dirId recursively
+function prefixPaths(nodes, dirId) {
+  return nodes.map(n => ({
+    ...n,
+    path: `${dirId}/${n.path}`,
+    children: n.children ? prefixPaths(n.children, dirId) : undefined,
+  }));
+}
+
+// --- Tree (merged from all dirs) ---
+app.get('/api/tree', async (_req, res) => {
+  try {
+    const dirs = await getLearnDirs();
+    const roots = [];
+    for (const d of dirs) {
+      const children = await buildTree(d.path, '', []);
+      roots.push({ name: d.name, path: d.id, type: 'dir', children: prefixPaths(children, d.id), _isRoot: true });
+    }
+    // If only one dir, return its children directly for cleaner UX
+    if (roots.length === 1) return res.json(roots[0].children);
+    res.json(roots);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/file', async (req, res) => {
+  try {
+    const { fullPath } = await resolvePath(req.query.path);
+    const content = await fs.readFile(fullPath, 'utf-8');
+    res.json({ content });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/file', async (req, res) => {
+  try {
+    const { path: filePath, content } = req.body;
+    const { fullPath } = await resolvePath(filePath);
+    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs.writeFile(fullPath, content, 'utf-8');
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/new', async (req, res) => {
+  try {
+    const { dir, name, dirId } = req.body;
+    const dirs = await getLearnDirs();
+    // Use specified dirId, or first dir as default
+    const targetDir = dirs.find(d => d.id === dirId) || dirs[0];
+    if (!targetDir) return res.status(400).json({ error: 'No directories configured' });
+    const fileName = name.endsWith('.md') ? name : name + '.md';
+    const fullPath = path.join(targetDir.path, dir || '', fileName);
+    await fs.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs.writeFile(fullPath, `# ${name.replace('.md', '')}\n\n`, 'utf-8');
+    const rel = path.relative(targetDir.path, fullPath);
+    res.json({ path: `${targetDir.id}/${rel}` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/folder', async (req, res) => {
+  try {
+    const { path: dirPath } = req.body;
+    const { fullPath } = await resolvePath(dirPath);
+    await fs.mkdir(fullPath, { recursive: true });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/rename', async (req, res) => {
+  try {
+    const { path: itemPath, newName } = req.body;
+    const { dir, fullPath, dirId } = await resolvePath(itemPath);
+    const newFullPath = path.join(path.dirname(fullPath), newName);
+    if (!newFullPath.startsWith(dir.path)) return res.status(400).json({ error: 'Invalid path' });
+    try { await fs.access(newFullPath); return res.status(409).json({ error: 'Name already exists' }); } catch {}
+    await fs.rename(fullPath, newFullPath);
+    if (fullPath.endsWith('.md')) {
+      const tsxOld = fullPath.replace(/\.md$/, '.tsx');
+      const tsxNew = newFullPath.replace(/\.md$/, '.tsx');
+      try { await fs.access(tsxOld); await fs.rename(tsxOld, tsxNew); } catch {}
+    }
+    res.json({ ok: true, newPath: `${dirId}/${path.relative(dir.path, newFullPath)}` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/delete', async (req, res) => {
+  try {
+    const { path: itemPath } = req.body;
+    const { dir, fullPath } = await resolvePath(itemPath);
+    if (fullPath === dir.path) return res.status(400).json({ error: 'Cannot delete root' });
+    await fs.rm(fullPath, { recursive: true });
+    if (fullPath.endsWith('.md')) {
+      const tsxPath = fullPath.replace(/\.md$/, '.tsx');
+      try { await fs.rm(tsxPath); } catch {}
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/upload', async (req, res) => {
+  try {
+    const { files, dirId } = req.body;
+    if (!files || !Array.isArray(files)) return res.status(400).json({ error: 'Missing files array' });
+
+    const dirs = await getLearnDirs();
+    const targetDir = dirs.find(d => d.id === dirId) || dirs[0];
+    if (!targetDir) return res.status(400).json({ error: 'No directories configured' });
+
+    const results = [];
+    for (const file of files) {
+      const fileName = file.name.endsWith('.md') ? file.name : file.name + '.md';
+      const filePath = file.dir ? path.join(file.dir, fileName) : fileName;
+      const fullPath = path.join(targetDir.path, filePath);
+
+      try {
+        await fs.mkdir(path.dirname(fullPath), { recursive: true });
+        await fs.writeFile(fullPath, file.content, 'utf-8');
+        results.push({ path: `${targetDir.id}/${filePath}`, ok: true });
+      } catch (err) {
+        results.push({ path: filePath, ok: false, error: err.message });
+      }
+    }
+
+    res.json({ results });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/move', async (req, res) => {
+  try {
+    const { from, to } = req.body;
+    const fromResolved = await resolvePath(from);
+    const toResolved = await resolvePath(to);
+    const name = path.basename(fromResolved.fullPath);
+    const fullTo = path.join(toResolved.fullPath, name);
+    if (!fullTo.startsWith(toResolved.dir.path)) return res.status(400).json({ error: 'Invalid path' });
+    await fs.mkdir(toResolved.fullPath, { recursive: true });
+    await fs.rename(fromResolved.fullPath, fullTo);
+    if (fromResolved.fullPath.endsWith('.md')) {
+      const tsxFrom = fromResolved.fullPath.replace(/\.md$/, '.tsx');
+      const tsxTo = fullTo.replace(/\.md$/, '.tsx');
+      try { await fs.access(tsxFrom); await fs.rename(tsxFrom, tsxTo); } catch {}
+    }
+    res.json({ ok: true, newPath: `${toResolved.dirId}/${path.relative(toResolved.dir.path, fullTo)}` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// --- Claude Usage Stats ---
+const CLAUDE_STATS_FILE = path.join(DATA_DIR, 'claude-stats.json');
+const DAILY_COST_FILE = path.join(DATA_DIR, 'daily-cost.json');
+const CLAUDE_PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
+let statsRebuilding = false;
+
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+async function collectJsonlFiles(dir) {
+  const results = [];
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) results.push(...await collectJsonlFiles(full));
+    else if (entry.name.endsWith('.jsonl')) results.push(full);
+  }
+  return results;
+}
+
+// Scan a single JSONL file and return its contribution to activity stats.
+async function scanJsonlFile(filePath, projDir) {
+  const sessionId = path.basename(filePath, '.jsonl');
+  const contrib = {
+    sessions: [],        // session IDs seen
+    cwd: null,
+    daily: {},           // date -> { messages, toolCalls, sessions: [ids] }
+    hourCounts: {},      // hour -> count
+    sessionMeta: {},     // sessionId -> { start, end, messageCount }
+  };
+  try {
+    const rl = createInterface({ input: createReadStream(filePath), crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      let record;
+      try { record = JSON.parse(line); } catch { continue; }
+      if (!contrib.cwd && typeof record.cwd === 'string' && record.cwd) {
+        contrib.cwd = record.cwd;
+      }
+      const ts = record.timestamp;
+      if (!ts) continue;
+      const localDate = new Date(ts);
+      const date = `${localDate.getFullYear()}-${String(localDate.getMonth()+1).padStart(2,'0')}-${String(localDate.getDate()).padStart(2,'0')}`;
+      const hour = localDate.getHours();
+
+      if (record.type === 'user' && record.userType === 'external') {
+        if (!contrib.sessions.includes(sessionId)) contrib.sessions.push(sessionId);
+        if (!contrib.daily[date]) contrib.daily[date] = { messages: 0, toolCalls: 0, sessions: [] };
+        if (!contrib.daily[date].sessions.includes(sessionId)) contrib.daily[date].sessions.push(sessionId);
+        if (!contrib.sessionMeta[sessionId]) contrib.sessionMeta[sessionId] = { start: ts, end: ts, messageCount: 0 };
+        contrib.sessionMeta[sessionId].messageCount++;
+        if (ts > contrib.sessionMeta[sessionId].end) contrib.sessionMeta[sessionId].end = ts;
+        if (ts < contrib.sessionMeta[sessionId].start) contrib.sessionMeta[sessionId].start = ts;
+      }
+
+      if (record.type === 'assistant') {
+        if (!contrib.daily[date]) contrib.daily[date] = { messages: 0, toolCalls: 0, sessions: [] };
+        contrib.daily[date].messages++;
+        contrib.hourCounts[hour] = (contrib.hourCounts[hour] || 0) + 1;
+        const msg = record.message || {};
+        if (Array.isArray(msg.content)) {
+          for (const block of msg.content) {
+            if (block.type === 'tool_use') contrib.daily[date].toolCalls++;
+          }
+        }
+      }
+    }
+  } catch { /* skip unreadable */ }
+  return contrib;
+}
+
+// Recompute activity totals by summing all per-file contributions.
+function aggregateContributions(fileContribs) {
+  const dailyActivity = {};  // date -> { messages, sessions: Set, toolCalls }
+  const hourCounts = {};
+  const sessions = new Set();
+  const sessionMeta = {};
+  const projectCwd = {};     // projDir -> cwd
+  let firstDate = null;
+
+  for (const [filePath, contrib] of Object.entries(fileContribs)) {
+    // Extract projDir from file path: .../projects/{projDir}/...
+    const projMatch = filePath.match(/projects\/([^/]+)\//);
+    const projDir = projMatch ? projMatch[1] : null;
+    if (projDir && contrib.cwd && !projectCwd[projDir]) {
+      projectCwd[projDir] = contrib.cwd;
+    }
+
+    for (const sid of (contrib.sessions || [])) sessions.add(sid);
+
+    for (const [date, day] of Object.entries(contrib.daily || {})) {
+      if (!dailyActivity[date]) dailyActivity[date] = { messages: 0, sessions: new Set(), toolCalls: 0 };
+      dailyActivity[date].messages += day.messages;
+      dailyActivity[date].toolCalls += day.toolCalls;
+      for (const sid of (day.sessions || [])) dailyActivity[date].sessions.add(sid);
+      if (!firstDate || date < firstDate) firstDate = date;
+    }
+
+    for (const [h, count] of Object.entries(contrib.hourCounts || {})) {
+      hourCounts[h] = (hourCounts[h] || 0) + count;
+    }
+
+    for (const [sid, meta] of Object.entries(contrib.sessionMeta || {})) {
+      if (!sessionMeta[sid]) {
+        sessionMeta[sid] = { ...meta };
+      } else {
+        sessionMeta[sid].messageCount += meta.messageCount;
+        if (meta.start < sessionMeta[sid].start) sessionMeta[sid].start = meta.start;
+        if (meta.end > sessionMeta[sid].end) sessionMeta[sid].end = meta.end;
+      }
+    }
+  }
+
+  return { dailyActivity, hourCounts, sessions, sessionMeta, projectCwd, firstDate };
+}
+
+async function updateStats() {
+  if (statsRebuilding) return;
+  statsRebuilding = true;
+  try {
+    // Load existing stats (includes _fileContribs and _processedFiles for incremental scan)
+    let oldStats = null;
+    try {
+      const raw = await fs.readFile(CLAUDE_STATS_FILE, 'utf-8');
+      oldStats = JSON.parse(raw);
+    } catch { /* no existing stats, fresh build */ }
+
+    const fileContribs = { ...(oldStats?._fileContribs || {}) };
+    const processedFiles = { ...(oldStats?._processedFiles || {}) };
+    let scanned = 0, skipped = 0;
+
+    // Incremental scan: only read new/changed JSONL files
+    const projectDirs = await fs.readdir(CLAUDE_PROJECTS_DIR).catch(() => []);
+    for (const projDir of projectDirs) {
+      const projPath = path.join(CLAUDE_PROJECTS_DIR, projDir);
+      const stat = await fs.stat(projPath).catch(() => null);
+      if (!stat?.isDirectory()) continue;
+      const files = await collectJsonlFiles(projPath);
+
+      for (const filePath of files) {
+        let fstat;
+        try { fstat = await fs.stat(filePath); } catch { continue; }
+        const prev = processedFiles[filePath];
+        if (prev && prev.size === fstat.size && prev.mtime === fstat.mtimeMs) {
+          skipped++;
+          continue;
+        }
+        // New or changed file — (re)scan and replace its contribution
+        fileContribs[filePath] = await scanJsonlFile(filePath, projDir);
+        processedFiles[filePath] = { size: fstat.size, mtime: fstat.mtimeMs };
+        scanned++;
+      }
+    }
+
+    // Recompute activity totals from all per-file contributions
+    const { dailyActivity, hourCounts, sessions, sessionMeta, projectCwd, firstDate } = aggregateContributions(fileContribs);
+
+    const sortedDates = Object.keys(dailyActivity).sort();
+    const newDailyActivityArr = sortedDates.map(date => ({
+      date,
+      messageCount: dailyActivity[date].messages,
+      sessionCount: dailyActivity[date].sessions.size,
+      toolCallCount: dailyActivity[date].toolCalls,
+    }));
+
+    let longestSession = null;
+    for (const [sid, meta] of Object.entries(sessionMeta)) {
+      const duration = new Date(meta.end) - new Date(meta.start);
+      if (!longestSession || duration > longestSession.duration) {
+        longestSession = { sessionId: sid, duration, messageCount: meta.messageCount, timestamp: meta.start };
+      }
+    }
+
+    // Pull token + cost data from ccusage (live LiteLLM pricing).
+    // ccusage does its own full scan — this will be replaced later.
+    let newDailyModelTokensArr = [];
+    let newDailyCostArr = [];
+    let newModelUsage = {};
+    let newTotalCost = 0;
+    let newProjectUsage = {};
+    try {
+      const ccusageBin = path.join(__dirname, 'node_modules', '.bin', 'ccusage');
+      const ccusageCmd = existsSync(ccusageBin) ? ccusageBin : 'npx ccusage';
+      const out = execSync(`${ccusageCmd} daily --instances --json`, { encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 });
+      const ccusageJson = JSON.parse(out);
+
+      const tokensByDate = {};
+      const costByDate = {};
+
+      for (const [encodedDir, entries] of Object.entries(ccusageJson.projects || {})) {
+        let projTotalCost = 0;
+        const projModels = {};
+        const projDailyMap = {};
+        const projDates = new Set();
+        let projFirstDate = null;
+        let projLastDate = null;
+
+        for (const entry of entries) {
+          const date = entry.date;
+          projDates.add(date);
+          if (!projFirstDate || date < projFirstDate) projFirstDate = date;
+          if (!projLastDate || date > projLastDate) projLastDate = date;
+          if (!projDailyMap[date]) projDailyMap[date] = { date, totalCostUSD: 0, models: {} };
+          const dayBucket = projDailyMap[date];
+
+          for (const m of entry.modelBreakdowns) {
+            if (!projModels[m.modelName]) projModels[m.modelName] = { outputTokens: 0, costUSD: 0 };
+            projModels[m.modelName].outputTokens += m.outputTokens;
+            projModels[m.modelName].costUSD += m.cost;
+            projTotalCost += m.cost;
+            if (!dayBucket.models[m.modelName]) dayBucket.models[m.modelName] = { outputTokens: 0, costUSD: 0 };
+            dayBucket.models[m.modelName].outputTokens += m.outputTokens;
+            dayBucket.models[m.modelName].costUSD += m.cost;
+            dayBucket.totalCostUSD += m.cost;
+            if (!tokensByDate[date]) tokensByDate[date] = {};
+            tokensByDate[date][m.modelName] = (tokensByDate[date][m.modelName] || 0)
+              + m.inputTokens + m.outputTokens;
+            if (!costByDate[date]) costByDate[date] = {};
+            costByDate[date][m.modelName] = (costByDate[date][m.modelName] || 0) + m.cost;
+            if (!newModelUsage[m.modelName]) {
+              newModelUsage[m.modelName] = { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0 };
+            }
+            const u = newModelUsage[m.modelName];
+            u.inputTokens += m.inputTokens;
+            u.outputTokens += m.outputTokens;
+            u.cacheReadInputTokens += m.cacheReadTokens;
+            u.cacheCreationInputTokens += m.cacheCreationTokens;
+            u.costUSD += m.cost;
+          }
+        }
+
+        newTotalCost += projTotalCost;
+        if (projTotalCost >= 10) {
+          const cwd = projectCwd[encodedDir];
+          const displayName = cwd ? path.basename(cwd) : encodedDir;
+          const dailyBreakdown = Object.values(projDailyMap)
+            .sort((a, b) => b.date.localeCompare(a.date))
+            .slice(0, 10);
+          newProjectUsage[encodedDir] = {
+            displayName, cwd: cwd || null, totalCostUSD: projTotalCost,
+            daysActive: projDates.size, firstActivity: projFirstDate, lastActivity: projLastDate,
+            models: projModels, dailyBreakdown,
+          };
+        }
+      }
+
+      newDailyModelTokensArr = Object.keys(tokensByDate).sort().map(date => ({ date, tokensByModel: tokensByDate[date] }));
+      newDailyCostArr = Object.keys(costByDate).sort().map(date => ({ date, costByModel: costByDate[date] }));
+    } catch (e) {
+      console.error('ccusage failed — token/cost data omitted.', e.message);
+    }
+
+    // For token/cost: merge with old stats to preserve data from deleted JSONL files
+    // (ccusage also reads JSONL, so it loses old data too)
+    const mergedDailyModelTokens = mergeDailyByDate(oldStats?.dailyModelTokens, newDailyModelTokensArr);
+    const mergedDailyCost = mergeDailyByDate(oldStats?.dailyCost, newDailyCostArr);
+    const mergedModelUsage = {};
+    const allModels = new Set([...Object.keys(oldStats?.modelUsage || {}), ...Object.keys(newModelUsage)]);
+    for (const model of allModels) {
+      const o = (oldStats?.modelUsage || {})[model] || {};
+      const n = newModelUsage[model] || {};
+      mergedModelUsage[model] = {
+        inputTokens: Math.max(o.inputTokens || 0, n.inputTokens || 0),
+        outputTokens: Math.max(o.outputTokens || 0, n.outputTokens || 0),
+        cacheReadInputTokens: Math.max(o.cacheReadInputTokens || 0, n.cacheReadInputTokens || 0),
+        cacheCreationInputTokens: Math.max(o.cacheCreationInputTokens || 0, n.cacheCreationInputTokens || 0),
+        costUSD: Math.max(o.costUSD || 0, n.costUSD || 0),
+      };
+    }
+    const mergedProjectUsage = { ...(oldStats?.projectUsage || {}), ...newProjectUsage };
+    const mergedTotalCost = mergedDailyCost.reduce((s, d) => Object.values(d.costByModel || {}).reduce((a, b) => a + b, 0) + s, 0);
+
+    const earliestDate = firstDate || oldStats?.firstSessionDate || (sortedDates.length > 0 ? sortedDates[0] : null);
+
+    const result = {
+      version: 7, lastComputedDate: todayStr(),
+      dailyActivity: newDailyActivityArr, dailyModelTokens: mergedDailyModelTokens, dailyCost: mergedDailyCost,
+      modelUsage: mergedModelUsage, projectUsage: mergedProjectUsage,
+      totalSessions: sessions.size,
+      totalMessages: newDailyActivityArr.reduce((s, d) => s + d.messageCount, 0),
+      totalCostUSD: mergedTotalCost, longestSession,
+      firstSessionDate: earliestDate,
+      hourCounts, totalSpeculationTimeSavedMs: 0, shotDistribution: {},
+      _fileContribs: fileContribs,
+      _processedFiles: processedFiles,
+    };
+
+    await fs.writeFile(CLAUDE_STATS_FILE, JSON.stringify(result), 'utf-8');
+    console.log(`Stats updated: ${sessions.size} sessions, ${result.totalMessages} msgs (scanned ${scanned}, skipped ${skipped})`);
+  } catch (e) {
+    console.error('Stats update failed:', e.message);
+  } finally {
+    statsRebuilding = false;
+  }
+}
+
+// Merge daily arrays by date: new scan wins for dates it has, old dates preserved
+function mergeDailyByDate(oldArr, newArr, dateKey = 'date') {
+  const map = new Map();
+  for (const entry of (oldArr || [])) map.set(entry[dateKey], entry);
+  for (const entry of (newArr || [])) map.set(entry[dateKey], entry);
+  return [...map.values()].sort((a, b) => a[dateKey].localeCompare(b[dateKey]));
+}
+
+// Rebuild on server start
+// [Euka] Disabled: Claude Code usage analytics (scans ~/.claude/projects)
+// belong to the Learn dashboard, not the career system. Route left dormant.
+// updateStats();
+
+const STATS_SCHEMA_VERSION = 7;
+
+app.get('/api/claude-stats', async (_req, res) => {
+  try {
+    // Trigger async rebuild if stale (date) or schema mismatch
+    try {
+      const raw = await fs.readFile(CLAUDE_STATS_FILE, 'utf-8');
+      const stats = JSON.parse(raw);
+      const schemaStale = (stats.version ?? 0) < STATS_SCHEMA_VERSION;
+      if (schemaStale) {
+        // Schema mismatch: force synchronous rebuild so the client gets fresh data immediately
+        await updateStats();
+        const fresh = JSON.parse(await fs.readFile(CLAUDE_STATS_FILE, 'utf-8'));
+        res.json(fresh);
+        return;
+      }
+      if (stats.lastComputedDate < todayStr()) updateStats();
+      res.json(stats);
+    } catch {
+      // No cache file yet, rebuild and return empty for now
+      updateStats();
+      res.json({ version: STATS_SCHEMA_VERSION, dailyActivity: [], dailyModelTokens: [], modelUsage: {}, projectUsage: {}, totalSessions: 0, totalMessages: 0, hourCounts: {} });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Claude Activity Pings (from hooks) ---
+const PINGS_FILE = path.join(DATA_DIR, 'claude-pings.json');
+if (!existsSync(PINGS_FILE)) writeFileSync(PINGS_FILE, '[]');
+
+app.post('/api/claude-ping', async (req, res) => {
+  try {
+    const b = req.body;
+    const pings = JSON.parse(await fs.readFile(PINGS_FILE, 'utf-8'));
+    pings.push({
+      ts: new Date().toISOString(),
+      session: b.session_id || 'unknown',
+      project: b.cwd ? path.basename(b.cwd) : 'unknown',
+    });
+    // Keep last 90 days (~keep generous, trim if > 50k)
+    if (pings.length > 50000) pings.splice(0, pings.length - 50000);
+    await writeJSON(PINGS_FILE, pings);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/claude-pings', async (_req, res) => {
+  try {
+    res.json(JSON.parse(await fs.readFile(PINGS_FILE, 'utf-8')));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// Career System: LLM cost observability
+// See META/.../01-foundation/03-llm-cost-observability
+// ─────────────────────────────────────────────────────────────
+
+// Zod schema — input record (ts auto-filled server-side)
+const CostRecordInput = z.object({
+  caller: z.string().min(1),             // e.g. 'evaluator:stage-a', 'tailor', 'applier'
+  model: z.string().min(1),              // e.g. 'claude-haiku-4-5', 'claude-sonnet-4-6'
+  input_tokens: z.number().int().nonnegative(),
+  output_tokens: z.number().int().nonnegative(),
+  cost_usd: z.number().nonnegative(),    // caller computes (model price × tokens)
+  session_id: z.string().optional(),
+  job_id: z.string().optional(),
+});
+
+async function appendCostRecord(input) {
+  const parsed = CostRecordInput.parse(input);  // throws ZodError on bad input
+  const record = { ts: new Date().toISOString(), ...parsed };
+  await fs.appendFile(LLM_COSTS_FILE, JSON.stringify(record) + '\n');
+  return record;
+}
+
+async function readCostRecords({ start, end, caller, model } = {}) {
+  let raw = '';
+  try { raw = await fs.readFile(LLM_COSTS_FILE, 'utf-8'); } catch { return []; }
+  const records = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try { records.push(JSON.parse(line)); } catch {
+      console.warn('[llm-costs] skipping malformed line:', line.slice(0, 80));
+    }
+  }
+  return records.filter(r => {
+    if (start && r.ts < start) return false;
+    if (end && r.ts > end) return false;
+    if (caller && r.caller !== caller) return false;
+    if (model && r.model !== model) return false;
+    return true;
+  });
+}
+
+function aggregateCosts(records, groupBy) {
+  if (!groupBy) {
+    return records.reduce((acc, r) => {
+      acc.total_cost += r.cost_usd;
+      acc.total_tokens += r.input_tokens + r.output_tokens;
+      acc.record_count += 1;
+      return acc;
+    }, { total_cost: 0, total_tokens: 0, record_count: 0 });
+  }
+  const buckets = {};
+  for (const r of records) {
+    let key;
+    if (groupBy === 'day') key = r.ts.slice(0, 10);
+    else if (groupBy === 'caller') key = r.caller;
+    else if (groupBy === 'model') key = r.model;
+    else throw new Error(`Unsupported groupBy: ${groupBy}`);
+    if (!buckets[key]) buckets[key] = { total_cost: 0, total_tokens: 0, record_count: 0 };
+    buckets[key].total_cost += r.cost_usd;
+    buckets[key].total_tokens += r.input_tokens + r.output_tokens;
+    buckets[key].record_count += 1;
+  }
+  return buckets;
+}
+
+// POST /api/career/llm-costs — caller appends a record
+app.post('/api/career/llm-costs', async (req, res) => {
+  try {
+    const record = await appendCostRecord(req.body);
+    res.status(201).json(record);
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid record', details: e.issues });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/career/llm-costs
+//   (no query)        → today's aggregate { total_cost, total_tokens, record_count }
+//   ?start=&end=      → ISO range filter
+//   ?caller= / ?model= → exact match filter
+//   ?groupBy=day|caller|model → bucketed aggregate
+app.get('/api/career/llm-costs', async (req, res) => {
+  try {
+    const { start, end, caller, model, groupBy } = req.query;
+    let filterStart = start, filterEnd = end;
+    // Default (no query params): today aggregate (local timezone day start → now)
+    const defaultMode = !start && !end && !caller && !model && !groupBy;
+    if (defaultMode) {
+      const now = new Date();
+      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      filterStart = todayStart.toISOString();
+    }
+    const records = await readCostRecords({ start: filterStart, end: filterEnd, caller, model });
+    if (groupBy) return res.json(aggregateCosts(records, groupBy));
+    if (defaultMode) return res.json(aggregateCosts(records));
+    res.json(records);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// Career System: Identity (你是谁) — data/career/identity.yml
+// See META/.../02-profile/01-identity
+// ─────────────────────────────────────────────────────────────
+
+// Partial-save design (m3): allow incremental save.
+// All strings accept empty; arrays min 0. Format checks (email/URL) happen
+// on frontend (malformed blocks save). Backend is permissive — shape is
+// validated, content is not. Applier/Evaluator re-check completeness at
+// use-time before consuming identity.
+// Bounds (DoS protection): same conventions as PreferencesSchema below —
+// strings ≤ 200 chars, arrays ≤ 50 entries.
+const ID_STR = z.string().max(200);
+
+const EducationEntrySchema = z.object({
+  school: ID_STR.optional(),
+  degree: ID_STR.optional(),
+  graduation: ID_STR.optional(),
+  gpa: ID_STR.optional(),
+});
+
+const LanguageEntrySchema = z.object({
+  lang: ID_STR.optional(),
+  level: z.enum(['Native', 'Fluent', 'Conversational', 'Basic']).optional(),
+});
+
+// Permissive: every field optional so a curl PUT with `{}` succeeds (matches
+// the m3 partial-save spec). Frontend's BLANK_IDENTITY supplies defaults for
+// boolean/object fields. Applier MUST re-check completeness at use-time.
+const IdentitySchema = z.object({
+  name: ID_STR.optional(),
+  email: ID_STR.optional(),               // format-check done on frontend
+  phone: ID_STR.optional(),
+  links: z.object({
+    linkedin: ID_STR.optional(),          // URL format-check done on frontend
+    github: ID_STR.optional(),
+    portfolio: ID_STR.optional(),
+  }).optional(),
+  location: z.object({
+    current_city: ID_STR.optional(),
+    current_country: ID_STR.optional(),
+  }).optional(),
+  legal: z.object({
+    visa_status: ID_STR.optional(),
+    visa_expiration: ID_STR.optional(),
+    needs_sponsorship_now: z.boolean().optional(),
+    needs_sponsorship_future: z.boolean().optional(),
+    authorized_us_yes_no: z.boolean().optional(),
+    citizenship: ID_STR.optional(),
+  }).optional(),
+  education: z.array(EducationEntrySchema).max(50).optional(),
+  languages: z.array(LanguageEntrySchema).max(50).optional(),
+});
+
+async function readIdentity() {
+  try {
+    const raw = await fs.readFile(IDENTITY_FILE, 'utf-8');
+    if (!raw.trim()) return null;
+    return yaml.load(raw);
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
+async function writeIdentity(obj) {
+  const parsed = IdentitySchema.parse(obj);
+  const yamlText = yaml.dump(parsed, { lineWidth: 120, noRefs: true });
+  await atomicWriteFile(IDENTITY_FILE, yamlText);
+  return parsed;
+}
+
+// GET — returns current identity or null if not yet created
+app.get('/api/career/identity', async (_req, res) => {
+  try {
+    const identity = await readIdentity();
+    res.json(identity);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT — replaces identity fully (zod-validated)
+app.put('/api/career/identity', async (req, res) => {
+  try {
+    const saved = await writeIdentity(req.body);
+    res.json(saved);
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid identity', details: e.issues });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// Career System: Preferences (你想要什么) — data/career/preferences.yml
+// See META/.../02-profile/02-preferences
+// ─────────────────────────────────────────────────────────────
+
+// Partial-save design (same as identity m3): permissive schema — structure
+// validated but content not. Missing fields don't block save; format errors
+// caught on frontend. Finder/Evaluator re-check completeness at use-time.
+//
+// Bounds (DoS protection): strings capped 200 chars, arrays 200 entries —
+// way over any realistic personal-use ceiling. Caps stop a malformed PUT or
+// abusive /preview body from blocking the event loop.
+const STR = z.string().max(200);
+const STRS = z.array(STR).max(200);
+
+const TargetRoleSchema = z.object({
+  title: STR,
+  seniority: STR,
+  function: STR.optional(),
+});
+
+const CompTargetSchema = z.object({
+  base_min: z.number().optional(),
+  base_max: z.number().optional(),
+  total_min: z.number().optional(),
+  total_max: z.number().optional(),
+  currency: STR,
+});
+
+const LocationPrefSchema = z.object({
+  accept_any: z.boolean(),
+  remote_only: z.boolean(),
+  hybrid_max_days_onsite: z.number().optional(),
+  preferred_cities: STRS,
+  acceptable_countries: STRS,
+});
+
+// 9 hard-filter rule IDs the user can disable without losing the value.
+// applyHardFilter() in src/career/finder/hardFilter.mjs honors this set.
+const RULE_IDS = [
+  'source_filter',
+  'company_blocklist',
+  'title_blocklist',
+  'title_allowlist',
+  'location',
+  'seniority',
+  'posted_within_days',
+  'comp_floor',
+  'jd_text_blocklist',
+];
+
+const HardFiltersSchema = z.object({
+  source_filter: z.object({
+    blocked_sources: STRS,
+  }),
+  company_blocklist: STRS,
+  title_blocklist: STRS,
+  title_allowlist: STRS,
+  location: z.object({
+    allowed_countries: STRS,
+    allowed_cities: STRS,
+    disallowed_countries: STRS,
+  }),
+  seniority: z.object({
+    allowed: STRS,
+  }),
+  posted_within_days: z.number(),
+  comp_floor: z.object({
+    base_min: z.number().optional(),
+    total_min: z.number().optional(),
+    currency: STR,
+  }),
+  jd_text_blocklist: STRS,
+  // find-jobs-redesign m1: per-rule disable without erasing the value.
+  // Empty / missing = all rules enabled (backward compatible).
+  disabled_rules: z.array(z.enum(RULE_IDS)).default([]),
+});
+
+const SoftPreferencesSchema = z.object({
+  company_types: STRS,
+  remote_culture: STRS,
+  tech_stack_preferred: STRS,
+  tech_stack_avoid: STRS,
+  industries_preferred: STRS,
+  industries_avoid: STRS,
+});
+
+const ScoringWeightsSchema = z.object({
+  tech_match: z.number(),
+  comp_match: z.number(),
+  location_match: z.number(),
+  company_match: z.number(),
+  growth_signal: z.number(),
+});
+
+const ThresholdsSchema = z.object({
+  strong: z.number(),
+  worth: z.number(),
+  consider: z.number(),
+  skip_below: z.number(),
+});
+
+const EvaluatorStrategySchema = z.object({
+  stage_a: z.object({
+    enabled: z.boolean(),
+    model: STR,
+    threshold: z.number(),
+  }),
+  stage_b: z.object({
+    enabled: z.boolean(),
+    model: STR,
+    blocks: z.object({
+      block_b: z.boolean(),
+      block_c: z.boolean(),
+      block_d: z.boolean(),
+      block_e: z.boolean(),
+      block_f: z.boolean(),
+      block_g: z.boolean(),
+      // 03-block-toggles m1: fine-grained sub-toggles. Flat keys (not
+      // nested objects) preserve YAML migrations as simple default-fills.
+      // block_d_websearch=false: D enabled but skips web_search → JD-
+      // inference only, saves ~$0.05/call. block_f_story_count: STAR+R
+      // story count for Block F (3-20, default 8). block_g_playwright=
+      // false: G enabled but skips verify_job_posting tool, relies on
+      // posted_at heuristic.
+      block_d_websearch: z.boolean().default(true),
+      block_f_story_count: z.number().int().min(3).max(20).default(8),
+      block_g_playwright: z.boolean().default(true),
+    }),
+    // Daily Sonnet+Tailor budget cap. 04-budget-gate enforces this:
+    // when today's total cost (incl. Haiku) reaches this threshold,
+    // Stage B and Tailor endpoints return 402 Payment Required.
+    // Default $10/day = ~30 Sonnet calls. Stage A (Haiku) is never
+    // gated regardless. See spec.md constraint #1.
+    daily_budget_usd: z.number().nonnegative().default(10),
+  }),
+});
+
+// Mode 2 applier behavior overrides. Default-off; opt-in via UI toggle.
+const ApplierPrefsSchema = z.object({
+  // When TRUE, the multi-step state machine auto-resolves an approve step
+  // when EVERY field in the draft satisfies the strict safety gate:
+  //   - confidence === 'high'
+  //   - class !== 'manual'
+  //   - !block_approve
+  // LOW/MEDIUM confidence, MANUAL class (CAPTCHA / rich text / shadow DOM),
+  // and explicit block_approve flags STILL pause regardless. This narrows
+  // the human-in-the-loop to only the cases where the AI is genuinely
+  // uncertain (constraints #1/#2/#3/#4 of 05-non-standard-controls still
+  // hold). Each auto-approve is logged to apply-sessions for audit.
+  auto_approve_when_safe: z.boolean().default(false),
+});
+
+const PreferencesSchema = z.object({
+  targets: z.array(TargetRoleSchema).max(50),
+  comp_target: CompTargetSchema,
+  location: LocationPrefSchema,
+  hard_filters: HardFiltersSchema,
+  soft_preferences: SoftPreferencesSchema,
+  scoring_weights: ScoringWeightsSchema,
+  thresholds: ThresholdsSchema,
+  evaluator_strategy: EvaluatorStrategySchema,
+  // Optional — older preferences.yml files predate this key; default-fill
+  // keeps GET responses backward compatible.
+  applier: ApplierPrefsSchema.default({ auto_approve_when_safe: false }),
+});
+
+function defaultPreferences() {
+  return {
+    targets: [],
+    comp_target: {
+      currency: 'USD',
+    },
+    location: {
+      accept_any: false,
+      remote_only: false,
+      preferred_cities: [],
+      acceptable_countries: [],
+    },
+    hard_filters: {
+      source_filter: { blocked_sources: [] },
+      company_blocklist: [],
+      title_blocklist: [],
+      title_allowlist: [],
+      location: {
+        allowed_countries: [],
+        allowed_cities: [],
+        disallowed_countries: [],
+      },
+      seniority: { allowed: [] },
+      posted_within_days: 0,
+      comp_floor: { currency: 'USD' },
+      jd_text_blocklist: [],
+      disabled_rules: [],
+    },
+    soft_preferences: {
+      company_types: [],
+      remote_culture: [],
+      tech_stack_preferred: [],
+      tech_stack_avoid: [],
+      industries_preferred: [],
+      industries_avoid: [],
+    },
+    scoring_weights: {
+      tech_match: 0.2,
+      comp_match: 0.2,
+      location_match: 0.2,
+      company_match: 0.2,
+      growth_signal: 0.2,
+    },
+    thresholds: {
+      strong: 4.5,
+      worth: 4.0,
+      consider: 3.5,
+      skip_below: 3.0,
+    },
+    evaluator_strategy: {
+      stage_a: {
+        enabled: true,
+        model: 'claude-haiku-4-5',
+        threshold: 3.5,
+      },
+      stage_b: {
+        enabled: true,
+        model: 'claude-sonnet-4-6',
+        daily_budget_usd: 10,
+        blocks: {
+          block_b: true,
+          block_c: false,
+          block_d: false,
+          block_e: true,
+          block_f: false,
+          block_g: false,
+          block_d_websearch: true,
+          block_f_story_count: 8,
+          block_g_playwright: true,
+        },
+      },
+    },
+    applier: {
+      auto_approve_when_safe: false,
+    },
+  };
+}
+
+async function readPreferences() {
+  try {
+    const raw = await fs.readFile(PREFERENCES_FILE, 'utf-8');
+    if (!raw.trim()) return defaultPreferences();
+    const loaded = yaml.load(raw);
+    return deepMerge(defaultPreferences(), loaded);
+  } catch (e) {
+    if (e.code === 'ENOENT') return defaultPreferences();
+    throw e;
+  }
+}
+
+async function writePreferences(obj) {
+  const parsed = PreferencesSchema.parse(obj);
+  const yamlText = yaml.dump(parsed, { lineWidth: 120, noRefs: true });
+  await atomicWriteFile(PREFERENCES_FILE, yamlText);
+  return parsed;
+}
+
+// GET — returns current preferences or defaultPreferences() if file missing
+app.get('/api/career/preferences', async (_req, res) => {
+  try {
+    const prefs = await readPreferences();
+    res.json(prefs);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT — replaces preferences fully (zod-validated)
+app.put('/api/career/preferences', async (req, res) => {
+  try {
+    const saved = await writePreferences(req.body);
+    res.json(saved);
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid preferences', details: e.issues });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/career/preferences/preview
+// Dry-run: applies the submitted hard_filters against the current pipeline.json
+// (no rescan, no writes). Body is the form draft Preferences object so the user
+// can preview unsaved edits. Compares against saved prefs to compute new_drops.
+// Returns: { total_jobs, would_drop, would_pass, new_drops, breakdown[] }
+app.post('/api/career/preferences/preview', async (req, res) => {
+  try {
+    const prefs = req.body;
+    if (!prefs || !prefs.hard_filters) {
+      return res.status(400).json({ error: 'Missing hard_filters in body' });
+    }
+
+    let jobs = [];
+    if (existsSync(PIPELINE_FILE)) {
+      try {
+        const parsed = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+        if (Array.isArray(parsed?.jobs)) jobs = parsed.jobs;
+      } catch (e) {
+        // Malformed pipeline.json should not crash preview — treat as empty.
+        console.warn('[preview] pipeline.json unparseable, treating as empty:', e?.message);
+      }
+    }
+
+    let savedPrefs = null;
+    try {
+      savedPrefs = await readPreferences();
+    } catch {
+      savedPrefs = null;
+    }
+
+    res.json(previewHardFilter(prefs, savedPrefs, jobs));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// Career System: Narrative & Proof Points — knowledge markdown docs
+// narrative.md (你的 north star / 写作风格) + proof-points.md (项目 / 文章 / OSS)
+// 两份都 commit 进 git。骨架 H2 是下游 Evaluator/CV-Tailor 抽取段落的软契约 —
+// 改 H2 名前要看 META/.../02-profile/03-narrative-proof
+// ─────────────────────────────────────────────────────────────
+
+const DEFAULT_NARRATIVE = `# Narrative
+
+## Origin
+_例如：本科学统计，工作两年发现自己更喜欢 ship product 而不是写论文，
+后来转去做 infra，发现把模糊系统问题想清楚比调一个模型更让我满足。1-2 段。_
+
+## Superpowers
+_例如：把模糊业务问题拆成可执行系统 — 在 X 项目里把 30 个边界条件
+梳理成 5 条短路规则，让 oncall 时间从每周 8h 降到 1h。每条 1-2 段 + 一个具体例子。_
+
+## North Star
+_例如：5 年内做能影响 100k+ 开发者日常工作流的 infra 工具；
+长期想 build 一家把工程师从重复性工作里解放出来的公司。_
+
+## Voice & Style
+_例如：偏好短句直给结论 + bullet list 列证据；不用 emoji；
+技术细节默认折叠；写 cover letter 倾向 1 段定位 + 1 段为什么这家公司，避免套话。_
+`;
+
+const DEFAULT_PROOF_POINTS = `# Proof Points
+
+## Shipped Projects
+_例如：_
+_- **Foo Pipeline** — 把 ETL 延迟从 2h 降到 5min，日处理 80M 行（[github](https://github.com/...)）_
+_- **Bar Dashboard** — 给 200+ 内部用户用，省下每周 12h 手工对账时间_
+
+## Writing
+_例如：_
+_- [How we cut Postgres tail latency by 80%](https://...) — Hacker News top 5_
+_- 内部 tech talk：实时数据架构演进（150 人参加）_
+
+## Open Source
+_例如：_
+_- **owner/repo** maintainer — 18k stars, 230 contributors, 40 releases_
+_- **other/lib** core contributor — 实现 streaming 模式，被 X 公司生产采用_
+
+## Quantified Wins
+_例如：_
+_- 把 P99 latency 从 800ms 降到 120ms（在 30 天内，无新增机器）_
+_- 把新员工 onboarding 时长从 3 天压到 4 小时_
+_- 主导 migration 把 5 个 monolith 拆成 12 个 service，无 downtime_
+`;
+
+async function readMarkdownDoc(file, fallback) {
+  try {
+    return await fs.readFile(file, 'utf-8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return fallback;
+    throw e;
+  }
+}
+
+async function writeMarkdownDoc(file, content) {
+  if (typeof content !== 'string') {
+    throw new TypeError('content must be a string');
+  }
+  await atomicWriteFile(file, content);
+}
+
+app.get('/api/career/narrative', async (_req, res) => {
+  try {
+    res.json({ content: await readMarkdownDoc(NARRATIVE_FILE, DEFAULT_NARRATIVE) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/career/narrative', async (req, res) => {
+  try {
+    await writeMarkdownDoc(NARRATIVE_FILE, req.body?.content);
+    res.json({ content: req.body.content });
+  } catch (e) {
+    if (e instanceof TypeError) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/career/proof-points', async (_req, res) => {
+  try {
+    res.json({ content: await readMarkdownDoc(PROOF_POINTS_FILE, DEFAULT_PROOF_POINTS) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/career/proof-points', async (req, res) => {
+  try {
+    await writeMarkdownDoc(PROOF_POINTS_FILE, req.body?.content);
+    res.json({ content: req.body.content });
+  } catch (e) {
+    if (e instanceof TypeError) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// Career System: QA Bank — three-layer storage
+//   data/career/qa-bank/legal.yml      — 法律/EEO/visa 固定答案 (gitignored)
+//   data/career/qa-bank/templates.md   — 开放题模板库 (committed)
+//   data/career/qa-bank/history.jsonl  — 每次 apply Q&A append-only (gitignored)
+// See META/.../02-profile/04-qa-bank
+// ─────────────────────────────────────────────────────────────
+
+// Permissive partial-save (same convention as IdentitySchema). All fields
+// optional so curl PUT {} succeeds. Frontend BLANK_LEGAL provides defaults.
+const QALegalSchema = z.object({
+  work_authorization: z.object({
+    status: ID_STR.optional(),
+    expiration: ID_STR.optional(),
+    requires_sponsorship_now: z.boolean().optional(),
+    requires_sponsorship_future: z.boolean().optional(),
+    authorized_us_yes_no: z.boolean().optional(),
+    citizenship: ID_STR.optional(),
+  }).optional(),
+  eeo: z.object({
+    gender: ID_STR.optional(),
+    ethnicity: ID_STR.optional(),
+    veteran: ID_STR.optional(),
+    disability: ID_STR.optional(),
+    pronouns: ID_STR.optional(),
+  }).optional(),
+  personal: z.object({
+    age_18_plus: z.boolean().optional(),
+    criminal_record: z.boolean().optional(),
+    can_pass_background_check: z.boolean().optional(),
+    can_pass_drug_test: z.boolean().optional(),
+    relocate_willing: z.boolean().optional(),
+    travel_willing_percent: z.number().min(0).max(100).optional(),
+  }).optional(),
+  how_did_you_hear_default: ID_STR.optional(),
+});
+
+function defaultLegal() {
+  return {
+    work_authorization: {},
+    eeo: {},
+    personal: {},
+    how_did_you_hear_default: '',
+  };
+}
+
+async function readLegal() {
+  try {
+    const raw = await fs.readFile(QA_LEGAL_FILE, 'utf-8');
+    if (!raw.trim()) return defaultLegal();
+    return deepMerge(defaultLegal(), yaml.load(raw));
+  } catch (e) {
+    if (e.code === 'ENOENT') return defaultLegal();
+    throw e;
+  }
+}
+
+async function writeLegal(obj) {
+  const parsed = QALegalSchema.parse(obj);
+  const yamlText = yaml.dump(parsed, { lineWidth: 120, noRefs: true });
+  await atomicWriteFile(QA_LEGAL_FILE, yamlText);
+  return parsed;
+}
+
+app.get('/api/career/qa-bank/legal', async (_req, res) => {
+  try { res.json(await readLegal()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/career/qa-bank/legal', async (req, res) => {
+  try { res.json(await writeLegal(req.body)); }
+  catch (e) {
+    if (e instanceof z.ZodError) return res.status(400).json({ error: 'Invalid legal', details: e.issues });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Templates — markdown text, same shape as narrative/proof-points endpoints.
+// File is committed (templates.md tracked in git as the example seed).
+app.get('/api/career/qa-bank/templates', async (_req, res) => {
+  try { res.json({ content: await readMarkdownDoc(QA_TEMPLATES_FILE, '') }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/career/qa-bank/templates', async (req, res) => {
+  try {
+    await writeMarkdownDoc(QA_TEMPLATES_FILE, req.body?.content);
+    res.json({ content: req.body.content });
+  } catch (e) {
+    if (e instanceof TypeError) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// History — append-only jsonl. Each line = one Q&A interaction during apply.
+// field_type powers per-class flywheel analysis; model_used powers cost-vs-quality.
+const QAHistoryFieldType = z.enum(['legal', 'open', 'eeo', 'other']);
+
+const QAHistoryRecordSchema = z.object({
+  ts: z.string().max(40).optional(),     // ISO 8601; server fills if omitted
+  job_id: z.string().max(200).optional(),
+  company: z.string().max(200).optional(),
+  role: z.string().max(200).optional(),
+  field_type: QAHistoryFieldType,
+  q: z.string().max(2000),
+  a_draft: z.string().max(5000).optional(),
+  a_final: z.string().max(5000).optional(),
+  edit_distance: z.number().optional(),
+  template_used: z.string().max(200).optional(),
+  model_used: z.string().max(80).optional(),
+});
+
+async function appendHistoryRecord(rec) {
+  const parsed = QAHistoryRecordSchema.parse(rec);
+  if (!parsed.ts) parsed.ts = new Date().toISOString();
+  await fs.appendFile(QA_HISTORY_FILE, JSON.stringify(parsed) + '\n', 'utf-8');
+  return parsed;
+}
+
+async function readHistoryRecords({ limit = 100, q } = {}) {
+  let raw;
+  try { raw = await fs.readFile(QA_HISTORY_FILE, 'utf-8'); }
+  catch (e) { if (e.code === 'ENOENT') return []; throw e; }
+  if (!raw.trim()) return [];
+  const lines = raw.split('\n').filter(l => l.trim());
+  const records = [];
+  for (const line of lines) {
+    try { records.push(JSON.parse(line)); } catch { /* skip malformed */ }
+  }
+  let filtered = records;
+  if (q) {
+    const needle = String(q).toLowerCase();
+    filtered = records.filter(r => {
+      const hay = `${r.q || ''} ${r.a_final || ''} ${r.a_draft || ''}`.toLowerCase();
+      return hay.includes(needle);
+    });
+  }
+  // Most recent first, capped at limit
+  return filtered.slice(-Math.max(1, Math.min(1000, Number(limit) || 100))).reverse();
+}
+
+app.post('/api/career/qa-bank/history', async (req, res) => {
+  try { res.json(await appendHistoryRecord(req.body)); }
+  catch (e) {
+    if (e instanceof z.ZodError) return res.status(400).json({ error: 'Invalid history record', details: e.issues });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/career/qa-bank/history', async (req, res) => {
+  try { res.json(await readHistoryRecords({ limit: req.query.limit, q: req.query.q })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─────────────────────────────────────────────────────────────
+// Career System: Renderer — markdown → CV-template HTML transformer
+// 04-renderer/02-markdown-to-template — debug endpoint. Real PDF pipeline
+// (04-renderer/01) imports markdownToTemplateHtml directly via function call.
+// ─────────────────────────────────────────────────────────────
+app.post('/api/career/render/markdown', (req, res) => {
+  const content = req.body?.content;
+  if (typeof content !== 'string') {
+    return res.status(400).json({ error: 'content must be a string' });
+  }
+  // 256KB cap already enforced globally on /api/career/* — defensive bound here
+  // for the day someone bumps the global cap and forgets resume markdown can grow.
+  if (content.length > 500_000) {
+    return res.status(413).json({ error: 'content too large (>500KB)' });
+  }
+  try {
+    const html = markdownToTemplateHtml(content);
+    res.json({ html, allowed_tags: ALLOWED_TAGS });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// CV PDF endpoint — the real renderer entry point.
+// Pipeline: resume markdown → markdownToTemplateHtml → composeCvHtml (with
+// identity.yml-driven header) → htmlToPdf → application/pdf stream.
+// Caller (CV editor preview / tailor-engine output / applier upload) decides
+// what to do with the bytes; renderer keeps no on-disk state.
+app.post('/api/career/render/pdf', async (req, res) => {
+  const md = req.body?.resume_markdown;
+  if (typeof md !== 'string') {
+    return res.status(400).json({ error: 'resume_markdown must be a string' });
+  }
+  if (md.length > 500_000) {
+    return res.status(413).json({ error: 'resume_markdown too large (>500KB)' });
+  }
+  try {
+    const identity = (await readIdentity()) ?? {};
+    const body_html = markdownToTemplateHtml(md);
+    const options = req.body?.options ?? {};
+    const html = composeCvHtml({ identity, body_html, options });
+    const pdf = await htmlToPdf(html, {
+      format: options.format,
+      margin: options.margin,
+    });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="resume.pdf"');
+    res.send(pdf);
+  } catch (e) {
+    console.warn('render/pdf failed:', e.message);
+    res.status(503).json({ error: e.message });
+  }
+});
+
+// HTML → PDF smoke endpoint. Low-level debug tool for the Playwright pipeline.
+// /api/career/render/pdf above is the real entry point for CV rendering.
+app.post('/api/career/render/_test-html-to-pdf', async (req, res) => {
+  const html = req.body?.html;
+  if (typeof html !== 'string') {
+    return res.status(400).json({ error: 'html must be a string' });
+  }
+  if (html.length > 1_000_000) {
+    return res.status(413).json({ error: 'html too large (>1MB)' });
+  }
+  try {
+    const pdf = await htmlToPdf(html, {
+      format: req.body?.format,
+      margin: req.body?.margin,
+    });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.send(pdf);
+  } catch (e) {
+    // Browser launch failures and chromium-not-installed land here.
+    console.warn('htmlToPdf failed:', e.message);
+    res.status(503).json({ error: e.message });
+  }
+});
+
+// Career scan scheduler — fires startScan({types: due}) every 60s based on
+// portals.yml::scan_cadence. Gated by DISABLE_SCAN_SCHEDULER=1 (set during
+// dev / tests when you don't want background scans). The scheduler's first
+// tick fires 60s after this registration, so initial server boot is quiet.
+//
+// Match exactly "1" — a truthiness check would disable on any non-empty
+// value including "0" / "false", which silently breaks deployments that
+// expect those to mean "don't disable".
+if (process.env.DISABLE_SCAN_SCHEDULER !== '1') {
+  startScheduler();
+  console.log('Scan scheduler enabled (master tick every 60s).');
+}
+
+// Clean shutdown: kill chromium subprocess on Ctrl+C / docker stop / nodemon
+// restart. Without this, Playwright leaves zombie browsers eating RAM.
+// Also stops the scan scheduler so no NEW ticks fire after this point.
+//
+// Trade-off: in-flight scans / enrichments are NOT drained. stopScheduler
+// only clears the interval timer; runScanCore's fire-and-forget body keeps
+// running after this returns. shutdownBrowser then closes chromium, which
+// crashes any pages mid-scrape (acceptable per jdEnrich tier-4 catch).
+// process.exit(0) hard-aborts whatever's still running. This means a scan
+// that was atomic-renaming pipeline.json or scan-cadence-state.json at
+// SIGTERM time may leave .tmp.{pid}.* files behind — readers tolerate the
+// missing target on next boot. We accept this over the complexity of an
+// in-flight-drain protocol.
+let _shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  console.log(`Received ${signal}, shutting down chromium...`);
+  stopScheduler();
+  await shutdownBrowser();
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// --- Compute dailyCost from JSONL session files and write to DAILY_COST_FILE ---
+// Pricing imported from the shared module — keeps server-side cost rollup
+// and evaluator runner cost computation in lockstep.
+
+async function computeDailyCost() {
+  const projectsDir = path.join(os.homedir(), '.claude', 'projects');
+  const dailyCost = {}; // date -> { model -> costUSD }
+
+  // Collect all JSONL files recursively
+  async function collectJsonl(dir) {
+    const results = [];
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) results.push(...await collectJsonl(full));
+      else if (entry.name.endsWith('.jsonl')) results.push(full);
+    }
+    return results;
+  }
+
+  const files = await collectJsonl(projectsDir);
+  for (const filePath of files) {
+    try {
+      const rl = createInterface({ input: createReadStream(filePath), crlfDelay: Infinity });
+      for await (const line of rl) {
+        if (!line.trim()) continue;
+        let record;
+        try { record = JSON.parse(line); } catch { continue; }
+        if (record.type !== 'assistant') continue;
+        const ts = record.timestamp;
+        if (!ts) continue;
+        const dt = new Date(ts);
+        const date = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+        const msg = record.message || {};
+        const model = msg.model;
+        const usage = msg.usage;
+        if (!model || !usage) continue;
+        // Use shared helper — same formula as the evaluator runner. Returns 0
+        // if the model isn't in MODEL_PRICING (no warn here; bulk session
+        // imports may include older models we don't price).
+        if (!MODEL_PRICING[model]) continue;
+        const cost = computeCostUsd(model, usage);
+        if (!dailyCost[date]) dailyCost[date] = {};
+        dailyCost[date][model] = (dailyCost[date][model] || 0) + cost;
+      }
+    } catch { /* skip unreadable files */ }
+  }
+
+  const dailyCostArr = Object.keys(dailyCost).sort().map(date => ({
+    date,
+    costByModel: dailyCost[date],
+  }));
+
+  // Write to our own file, never touch stats-cache
+  await fs.writeFile(DAILY_COST_FILE, JSON.stringify(dailyCostArr), 'utf-8');
+  console.log(`dailyCost computed: ${dailyCostArr.length} days`);
+}
+
+// Run on startup, then every 10 minutes
+// [Euka] Disabled: daily Claude-cost rollup is a Learn-dashboard analytic.
+// computeDailyCost();
+// setInterval(computeDailyCost, 10 * 60 * 1000);
+
+// ─────────────────────────────────────────────────────────────
+// Career System: Resume Index — multi-resume management
+// 03-cv-engine/01-resume-index — data layer for tailored CVs.
+//   index.yml                    — list of all base resumes (committed)
+//   {id}/metadata.yml            — match rules / emphasize / renderer (committed)
+//   {id}/base.md                 — resume markdown content (gitignored)
+//   {id}/versions/               — auto-snapshots on edit (gitignored)
+// ─────────────────────────────────────────────────────────────
+
+// Slug regex enforced everywhere. Matches the documented constraint and is
+// the first line of defense against path traversal — `..` and `/` can't
+// satisfy this character class.
+const RESUME_ID_RE = /^[a-z0-9-]{1,40}$/;
+const RESERVED_RESUME_IDS = new Set(['index']); // collides with index.yml
+
+function validateResumeId(id) {
+  return typeof id === 'string'
+    && RESUME_ID_RE.test(id)
+    && !RESERVED_RESUME_IDS.has(id);
+}
+
+// Belt-and-suspenders: regex would already block `..`/`/`, but resolve+prefix
+// check guards against anything sneaky a future schema relaxation might allow.
+function resolveResumeDir(id) {
+  if (!validateResumeId(id)) {
+    const e = new Error('invalid resume id');
+    e.status = 400;
+    throw e;
+  }
+  const dir = path.resolve(RESUMES_DIR, id);
+  if (!dir.startsWith(RESUMES_DIR + path.sep) && dir !== RESUMES_DIR) {
+    const e = new Error('invalid resume path');
+    e.status = 400;
+    throw e;
+  }
+  return dir;
+}
+
+const ResumeIndexEntrySchema = z.object({
+  id: z.string().regex(RESUME_ID_RE),
+  title: z.string().max(200),
+  description: z.string().max(500).optional(),
+  source: z.enum(['manual', 'google_doc']),
+  gdoc_id: z.string().max(200).optional(),
+  last_synced_at: z.string().max(40).optional(),
+  is_default: z.boolean(),
+  created_at: z.string().max(40),
+});
+
+const ResumeIndexSchema = z.object({
+  resumes: z.array(ResumeIndexEntrySchema).max(50),
+});
+
+const MatchRulesSchema = z.object({
+  role_keywords: z.array(z.string().max(100)).max(50).default([]),
+  jd_keywords: z.array(z.string().max(100)).max(50).default([]),
+  negative_keywords: z.array(z.string().max(100)).max(50).default([]),
+});
+
+const EmphasizeSchema = z.object({
+  projects: z.array(z.string().max(100)).max(50).default([]),
+  skills: z.array(z.string().max(100)).max(50).default([]),
+  narrative: z.string().max(2000).optional(),
+});
+
+const RendererConfigSchema = z.object({
+  template: z.string().max(50).default('default'),
+  font: z.string().max(50).optional(),
+  accent_color: z.string().max(20).default('#0969da'),
+});
+
+const ResumeMetadataSchema = z.object({
+  archetype: z.string().max(100).optional(),
+  match_rules: MatchRulesSchema.default({}),
+  emphasize: EmphasizeSchema.default({}),
+  renderer: RendererConfigSchema.default({}),
+});
+
+const NewResumeSchema = z.object({
+  id: z.string().regex(RESUME_ID_RE),
+  title: z.string().min(1).max(200),
+  description: z.string().max(500).optional(),
+  source: z.enum(['manual', 'google_doc']),
+  gdoc_id: z.string().max(200).optional(),
+  set_default: z.boolean().optional(),
+});
+
+// H2 sections here are a soft contract with downstream consumers
+// (04-renderer's CV template + future 03-cv-engine tailor-engine + 04-auto-select
+//  match-rule extractors) — keep them aligned with narrative/proof-points
+// skeletons.
+const DEFAULT_BASE_MD = `# Resume
+
+## Experience
+
+_例如：_
+_- **Company** — Title (Month YYYY – Month YYYY)_
+_  - Bullet 1_
+_  - Bullet 2_
+
+## Education
+
+_例如：_
+_- **University** — Degree (YYYY)_
+
+## Skills
+
+_例如：_
+_- Languages: ..._
+_- Frameworks: ..._
+
+## Projects
+
+_例如：_
+_- **Project name** — one-line description._
+`;
+
+async function readResumeIndex() {
+  try {
+    const raw = await fs.readFile(RESUMES_INDEX_FILE, 'utf-8');
+    if (!raw.trim()) return { resumes: [] };
+    const loaded = yaml.load(raw);
+    return ResumeIndexSchema.parse(loaded ?? { resumes: [] });
+  } catch (e) {
+    if (e.code === 'ENOENT') return { resumes: [] };
+    throw e;
+  }
+}
+
+async function writeResumeIndex(idx) {
+  const parsed = ResumeIndexSchema.parse(idx);
+  const yamlText = yaml.dump(parsed, { lineWidth: 120, noRefs: true });
+  await atomicWriteFile(RESUMES_INDEX_FILE, yamlText);
+  return parsed;
+}
+
+async function readResumeMetadata(id) {
+  const dir = resolveResumeDir(id);
+  const file = path.join(dir, 'metadata.yml');
+  try {
+    const raw = await fs.readFile(file, 'utf-8');
+    if (!raw.trim()) return ResumeMetadataSchema.parse({});
+    return ResumeMetadataSchema.parse(yaml.load(raw) ?? {});
+  } catch (e) {
+    if (e.code === 'ENOENT') return ResumeMetadataSchema.parse({});
+    throw e;
+  }
+}
+
+async function writeResumeMetadata(id, obj) {
+  const dir = resolveResumeDir(id);
+  const file = path.join(dir, 'metadata.yml');
+  const parsed = ResumeMetadataSchema.parse(obj);
+  const yamlText = yaml.dump(parsed, { lineWidth: 120, noRefs: true });
+  await atomicWriteFile(file, yamlText);
+  return parsed;
+}
+
+// GET — full index
+app.get('/api/career/resumes', async (_req, res) => {
+  try {
+    res.json(await readResumeIndex());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST — create new resume (dir + metadata.yml + base.md skeleton + index entry)
+app.post('/api/career/resumes', async (req, res) => {
+  try {
+    const parsed = NewResumeSchema.parse(req.body);
+    if (RESERVED_RESUME_IDS.has(parsed.id)) {
+      return res.status(400).json({ error: `id "${parsed.id}" is reserved` });
+    }
+    const idx = await readResumeIndex();
+    if (idx.resumes.some(r => r.id === parsed.id)) {
+      return res.status(409).json({ error: `id "${parsed.id}" already in use` });
+    }
+    const dir = resolveResumeDir(parsed.id);
+    await fs.mkdir(path.join(dir, 'versions'), { recursive: true });
+    await writeResumeMetadata(parsed.id, {});
+    await atomicWriteFile(path.join(dir, 'base.md'), DEFAULT_BASE_MD);
+
+    const newEntry = {
+      id: parsed.id,
+      title: parsed.title,
+      description: parsed.description,
+      source: parsed.source,
+      gdoc_id: parsed.gdoc_id,
+      is_default: false,
+      created_at: new Date().toISOString(),
+    };
+    let resumes = idx.resumes.slice();
+    if (parsed.set_default) {
+      resumes = resumes.map(r => ({ ...r, is_default: false }));
+      newEntry.is_default = true;
+    }
+    resumes.push(newEntry);
+    await writeResumeIndex({ resumes });
+
+    res.status(201).json(newEntry);
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid resume', details: e.issues });
+    }
+    if (e.status === 400) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE — remove from index + rm dir (recursive, no archive)
+app.delete('/api/career/resumes/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!validateResumeId(id)) return res.status(400).json({ error: 'invalid id' });
+    const idx = await readResumeIndex();
+    const before = idx.resumes.length;
+    const next = idx.resumes.filter(r => r.id !== id);
+    if (next.length === before) return res.status(404).json({ error: 'not found' });
+    await writeResumeIndex({ resumes: next });
+    const dir = resolveResumeDir(id);
+    await fs.rm(dir, { recursive: true, force: true });
+    res.json({ deleted: id });
+  } catch (e) {
+    if (e.status === 400) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PATCH — set is_default atomically (exactly one default at a time)
+app.patch('/api/career/resumes/:id/set-default', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!validateResumeId(id)) return res.status(400).json({ error: 'invalid id' });
+    const idx = await readResumeIndex();
+    if (!idx.resumes.some(r => r.id === id)) return res.status(404).json({ error: 'not found' });
+    const next = {
+      resumes: idx.resumes.map(r => ({ ...r, is_default: r.id === id })),
+    };
+    await writeResumeIndex(next);
+    res.json(next);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET / PUT metadata
+app.get('/api/career/resumes/:id/metadata', async (req, res) => {
+  try {
+    res.json(await readResumeMetadata(req.params.id));
+  } catch (e) {
+    if (e.status === 400) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/career/resumes/:id/metadata', async (req, res) => {
+  try {
+    const idx = await readResumeIndex();
+    if (!idx.resumes.some(r => r.id === req.params.id)) {
+      return res.status(404).json({ error: 'not found' });
+    }
+    res.json(await writeResumeMetadata(req.params.id, req.body));
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid metadata', details: e.issues });
+    }
+    if (e.status === 400) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /:id/duplicate — atomic clone of metadata + fresh base.md skeleton.
+// Semantics: "start a new direction from this archetype" — copies match rules
+// / emphasize / renderer config but NOT base.md content. If the user wants
+// to clone the actual resume body, paste-import once 03-in-ui-editor lands.
+app.post('/api/career/resumes/:id/duplicate', async (req, res) => {
+  try {
+    const sourceId = req.params.id;
+    if (!validateResumeId(sourceId)) return res.status(400).json({ error: 'invalid source id' });
+
+    const newId = req.body?.new_id;
+    if (!validateResumeId(newId)) return res.status(400).json({ error: 'invalid new_id (slug only, max 40)' });
+    if (RESERVED_RESUME_IDS.has(newId)) return res.status(400).json({ error: `id "${newId}" is reserved` });
+
+    const idx = await readResumeIndex();
+    const source = idx.resumes.find(r => r.id === sourceId);
+    if (!source) return res.status(404).json({ error: 'source not found' });
+    if (idx.resumes.some(r => r.id === newId)) {
+      return res.status(409).json({ error: `id "${newId}" already in use` });
+    }
+
+    const sourceMetadata = await readResumeMetadata(sourceId);
+    const newDir = resolveResumeDir(newId);
+    await fs.mkdir(path.join(newDir, 'versions'), { recursive: true });
+    await writeResumeMetadata(newId, sourceMetadata);
+    await atomicWriteFile(path.join(newDir, 'base.md'), DEFAULT_BASE_MD);
+
+    const newTitle = (typeof req.body?.new_title === 'string' && req.body.new_title.trim())
+      ? req.body.new_title.trim().slice(0, 200)
+      : `${source.title} (copy)`;
+    const newEntry = {
+      id: newId,
+      title: newTitle,
+      description: source.description,
+      source: 'manual',  // duplicates are always manual; gdoc link is unique
+      is_default: false,
+      created_at: new Date().toISOString(),
+    };
+    await writeResumeIndex({ resumes: [...idx.resumes, newEntry] });
+    res.status(201).json(newEntry);
+  } catch (e) {
+    if (e.status === 400) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// Resume content + versions + render
+// 03-cv-engine/03-in-ui-editor — full editor pipeline.
+//   GET /:id/content                  base.md text + versions list
+//   PUT /:id/content                  snapshot prior + atomic write + FIFO 50
+//   GET /:id/versions/:filename       single snapshot read
+//   GET /:id/render                   PDF stream (reads base.md + identity +
+//                                     metadata.renderer → composeCvHtml →
+//                                     htmlToPdf)
+// ─────────────────────────────────────────────────────────────
+
+const VERSION_FILENAME_RE = /^[0-9TZ\-:.]{10,40}\.md$/i;
+const VERSIONS_CAP = 50;
+const GOOGLE_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+const GOOGLE_OAUTH_START_PATH = '/api/career/google/oauth/start';
+const pendingGoogleOauthStates = new Map();
+
+// ISO 8601 with colons replaced by dashes — keeps lexical sort + filename-safe.
+function isoSnapshotFilename() {
+  return new Date().toISOString().replace(/:/g, '-') + '.md';
+}
+
+function cleanupGoogleOauthStates() {
+  const now = Date.now();
+  for (const [state, createdAt] of pendingGoogleOauthStates) {
+    if (now - createdAt > GOOGLE_OAUTH_STATE_TTL_MS) pendingGoogleOauthStates.delete(state);
+  }
+}
+
+function issueGoogleOauthState() {
+  cleanupGoogleOauthStates();
+  const state = randomBytes(24).toString('hex');
+  pendingGoogleOauthStates.set(state, Date.now());
+  return state;
+}
+
+function consumeGoogleOauthState(state) {
+  cleanupGoogleOauthStates();
+  const createdAt = pendingGoogleOauthStates.get(state);
+  if (!createdAt) return false;
+  pendingGoogleOauthStates.delete(state);
+  return Date.now() - createdAt <= GOOGLE_OAUTH_STATE_TTL_MS;
+}
+
+function googleOauthHtml(title, body) {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>${title}</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 40px auto; max-width: 640px; padding: 0 20px; color: #111827; }
+      .card { border: 1px solid #d0d7de; border-radius: 12px; padding: 20px 24px; background: #fff; box-shadow: 0 8px 24px rgba(0,0,0,0.06); }
+      h1 { margin: 0 0 12px; font-size: 24px; }
+      p { line-height: 1.6; color: #374151; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.95em; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>${title}</h1>
+      ${body}
+    </div>
+    <script>
+      if (window.opener) {
+        setTimeout(() => window.close(), 1200);
+      }
+    </script>
+  </body>
+</html>`;
+}
+
+async function readCareerOauth() {
+  try {
+    return await readJSON(CAREER_OAUTH_FILE);
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
+async function writeCareerOauth(oauth) {
+  await writeJSON(CAREER_OAUTH_FILE, oauth);
+  return oauth;
+}
+
+async function clearCareerOauth() {
+  await fs.rm(CAREER_OAUTH_FILE, { force: true }).catch(() => {});
+}
+
+async function getGoogleOauthClientConfig() {
+  const config = await readJSON(CONFIG_FILE).catch(() => ({}));
+  const clientId = process.env.GOOGLE_CLIENT_ID || config.googleClientId;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET || config.googleClientSecret;
+  if (!clientId || !clientSecret) {
+    const e = new Error(
+      'Google OAuth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET, or add googleClientId/googleClientSecret to data/config.json.'
+    );
+    e.status = 503;
+    throw e;
+  }
+  return { clientId, clientSecret };
+}
+
+function getGoogleOauthRedirectUri() {
+  const base = process.env.CAREER_GOOGLE_REDIRECT_BASE_URL || `http://localhost:${process.env.PORT || 8000}`;
+  return new URL('/api/career/google/oauth/callback', base).toString();
+}
+
+async function listResumeVersions(id) {
+  const dir = path.join(resolveResumeDir(id), 'versions');
+  let names;
+  try {
+    names = await fs.readdir(dir);
+  } catch (e) {
+    if (e.code === 'ENOENT') return [];
+    throw e;
+  }
+  const entries = [];
+  for (const filename of names) {
+    if (!VERSION_FILENAME_RE.test(filename)) continue;
+    try {
+      const stat = await fs.stat(path.join(dir, filename));
+      entries.push({
+        filename,
+        ts: stat.mtime.toISOString(),
+        size: stat.size,
+      });
+    } catch { /* skip unreadable */ }
+  }
+  // Newest first.
+  entries.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+  return entries;
+}
+
+// FIFO eviction once cap is exceeded. Called after a fresh snapshot is written.
+async function pruneResumeVersions(id) {
+  const dir = path.join(resolveResumeDir(id), 'versions');
+  const entries = await listResumeVersions(id);
+  if (entries.length <= VERSIONS_CAP) return;
+  // Drop the oldest (entries are newest-first).
+  const toDelete = entries.slice(VERSIONS_CAP);
+  for (const e of toDelete) {
+    await fs.rm(path.join(dir, e.filename), { force: true }).catch(() => {});
+  }
+}
+
+async function readResumeContent(id) {
+  const baseFile = path.join(resolveResumeDir(id), 'base.md');
+  try {
+    return await fs.readFile(baseFile, 'utf-8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return DEFAULT_BASE_MD;
+    throw e;
+  }
+}
+
+async function snapshotResumeContent(id) {
+  const dir = resolveResumeDir(id);
+  const baseFile = path.join(dir, 'base.md');
+  const versionsDir = path.join(dir, 'versions');
+  await fs.mkdir(versionsDir, { recursive: true });
+
+  let snapshotName = null;
+  try {
+    const previous = await fs.readFile(baseFile, 'utf-8');
+    if (previous.trim().length > 0) {
+      snapshotName = isoSnapshotFilename();
+      await atomicWriteFile(path.join(versionsDir, snapshotName), previous);
+    }
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
+  return snapshotName;
+}
+
+async function writeResumeContentWithSnapshot(id, content) {
+  const baseFile = path.join(resolveResumeDir(id), 'base.md');
+  const snapshot = await snapshotResumeContent(id);
+  await atomicWriteFile(baseFile, content);
+  await pruneResumeVersions(id);
+  return snapshot;
+}
+
+// OAuth bootstrap for Google Docs sync.
+app.get('/api/career/google/oauth/start', async (_req, res) => {
+  try {
+    const { clientId } = await getGoogleOauthClientConfig();
+    const state = issueGoogleOauthState();
+    const redirectUri = getGoogleOauthRedirectUri();
+    res.redirect(buildGoogleOAuthUrl({ clientId, redirectUri, state }));
+  } catch (e) {
+    const status = e.status || 500;
+    res.status(status).type('html').send(
+      googleOauthHtml(
+        'Google OAuth Setup Needed',
+        `<p>${e.message}</p><p>Once the client credentials are configured, reopen <code>${GOOGLE_OAUTH_START_PATH}</code>.</p>`
+      )
+    );
+  }
+});
+
+app.get('/api/career/google/oauth/callback', async (req, res) => {
+  try {
+    const googleErrorCode = req.query.error;
+    if (googleErrorCode) {
+      return res.status(400).type('html').send(
+        googleOauthHtml(
+          'Google Authorization Cancelled',
+          `<p>Google returned <code>${String(googleErrorCode)}</code>. You can close this tab and try again from the dashboard.</p>`
+        )
+      );
+    }
+
+    const state = typeof req.query.state === 'string' ? req.query.state : '';
+    const code = typeof req.query.code === 'string' ? req.query.code : '';
+    if (!state || !consumeGoogleOauthState(state)) {
+      return res.status(400).type('html').send(
+        googleOauthHtml('Invalid OAuth State', '<p>This authorization link expired or is invalid. Start the Google auth flow again from the dashboard.</p>')
+      );
+    }
+    if (!code) {
+      return res.status(400).type('html').send(
+        googleOauthHtml('Missing Authorization Code', '<p>Google did not return an authorization code. Please retry the auth flow.</p>')
+      );
+    }
+
+    const { clientId, clientSecret } = await getGoogleOauthClientConfig();
+    const redirectUri = getGoogleOauthRedirectUri();
+    const tokens = await exchangeGoogleAuthCode({ clientId, clientSecret, redirectUri, code });
+    if (!tokens.refresh_token) {
+      throw new Error('Google did not return a refresh token. Revoke the app and retry, or ensure consent is granted again.');
+    }
+
+    await writeCareerOauth({
+      provider: 'google',
+      refresh_token: tokens.refresh_token,
+      token_type: tokens.token_type || 'Bearer',
+      scope: tokens.scope || '',
+      updated_at: new Date().toISOString(),
+    });
+
+    res.type('html').send(
+      googleOauthHtml(
+        'Google Connected',
+        '<p>Authorization succeeded. You can close this tab and click <code>Sync Now</code> again in the dashboard.</p>'
+      )
+    );
+  } catch (e) {
+    res.status(e.status || 500).type('html').send(
+      googleOauthHtml('Google Authorization Failed', `<p>${e.message}</p><p>Close this tab and retry from the dashboard.</p>`)
+    );
+  }
+});
+
+// GET — returns content + versions list (newest first).
+app.get('/api/career/resumes/:id/content', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!validateResumeId(id)) return res.status(400).json({ error: 'invalid id' });
+    const idx = await readResumeIndex();
+    const entry = idx.resumes.find(r => r.id === id);
+    if (!entry) return res.status(404).json({ error: 'not found' });
+    const [content, versions] = await Promise.all([
+      readResumeContent(id),
+      listResumeVersions(id),
+    ]);
+    res.json({ content, versions, source: entry.source });
+  } catch (e) {
+    if (e.status === 400) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// PUT — pre-write snapshot of current base.md, then atomic write new content,
+// then FIFO-prune versions/ to VERSIONS_CAP.
+app.put('/api/career/resumes/:id/content', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!validateResumeId(id)) return res.status(400).json({ error: 'invalid id' });
+    const content = req.body?.content;
+    if (typeof content !== 'string') {
+      return res.status(400).json({ error: 'content must be a string' });
+    }
+    if (content.length > 500_000) {
+      return res.status(413).json({ error: 'content too large (>500KB)' });
+    }
+    const idx = await readResumeIndex();
+    const entry = idx.resumes.find(r => r.id === id);
+    if (!entry) return res.status(404).json({ error: 'not found' });
+    if (entry.source === 'google_doc') {
+      return res.status(409).json({ error: 'google_doc resumes are read-only in the in-app editor. Use Sync Now from the Resumes page.' });
+    }
+
+    const snapshotName = await writeResumeContentWithSnapshot(id, content);
+    res.json({ content, snapshot: snapshotName });
+  } catch (e) {
+    if (e.status === 400) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+const ResumeSyncRequestSchema = z.object({
+  gdoc_id: z.string().max(500).optional(),
+});
+
+app.post('/api/career/resumes/:id/sync', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!validateResumeId(id)) return res.status(400).json({ error: 'invalid id' });
+
+    const parsed = ResumeSyncRequestSchema.parse(req.body ?? {});
+    const idx = await readResumeIndex();
+    const entry = idx.resumes.find(r => r.id === id);
+    if (!entry) return res.status(404).json({ error: 'not found' });
+    if (entry.source !== 'google_doc') {
+      return res.status(409).json({ error: 'Only resumes with source=google_doc can be synced.' });
+    }
+
+    const docIdInput = parsed.gdoc_id ?? entry.gdoc_id;
+    const docId = normalizeGoogleDocId(docIdInput ?? '');
+    if (!docId) {
+      return res.status(400).json({ error: 'Missing Google Doc ID. Paste the Google Doc URL or ID and retry.' });
+    }
+
+    const oauth = await readCareerOauth();
+    if (!oauth?.refresh_token) {
+      return res.status(409).json({
+        error: 'Google authorization required. Finish OAuth once, then click Sync Now again.',
+        auth_required: true,
+        authorize_path: GOOGLE_OAUTH_START_PATH,
+      });
+    }
+
+    const { clientId, clientSecret } = await getGoogleOauthClientConfig();
+    let accessToken;
+    try {
+      const refreshed = await refreshGoogleAccessToken({
+        clientId,
+        clientSecret,
+        refreshToken: oauth.refresh_token,
+      });
+      accessToken = refreshed.access_token;
+    } catch (e) {
+      if (e.google_error === 'invalid_grant') {
+        await clearCareerOauth();
+        return res.status(409).json({
+          error: 'Stored Google authorization expired. Reconnect Google and retry the sync.',
+          auth_required: true,
+          authorize_path: GOOGLE_OAUTH_START_PATH,
+        });
+      }
+      throw e;
+    }
+
+    const markdown = await exportGoogleDocAsMarkdown({ accessToken, docId });
+    if (markdown.length > 500_000) {
+      return res.status(413).json({ error: 'exported markdown too large (>500KB)' });
+    }
+
+    const snapshot = await writeResumeContentWithSnapshot(id, markdown);
+    const syncedAt = new Date().toISOString();
+    const next = {
+      resumes: idx.resumes.map(r => {
+        if (r.id !== id) return r;
+        return {
+          ...r,
+          gdoc_id: docId,
+          last_synced_at: syncedAt,
+        };
+      }),
+    };
+    await writeResumeIndex(next);
+    const updated = next.resumes.find(r => r.id === id);
+
+    res.json({
+      ok: true,
+      snapshot,
+      resume: updated,
+      synced_at: syncedAt,
+    });
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid sync payload', details: e.issues });
+    }
+    if (e.status === 400) return res.status(400).json({ error: e.message });
+    if (e.status === 503) return res.status(503).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET single version — used by m3 versions UI for restore preview.
+app.get('/api/career/resumes/:id/versions/:filename', async (req, res) => {
+  try {
+    const { id, filename } = req.params;
+    if (!validateResumeId(id)) return res.status(400).json({ error: 'invalid id' });
+    // basename + regex defence — refuses anything that isn't a snapshot filename.
+    const safe = path.basename(filename);
+    if (!VERSION_FILENAME_RE.test(safe)) {
+      return res.status(400).json({ error: 'invalid version filename' });
+    }
+    const file = path.join(resolveResumeDir(id), 'versions', safe);
+    let content;
+    try {
+      content = await fs.readFile(file, 'utf-8');
+    } catch (e) {
+      if (e.code === 'ENOENT') return res.status(404).json({ error: 'version not found' });
+      throw e;
+    }
+    const stat = await fs.stat(file);
+    res.json({ content, ts: stat.mtime.toISOString(), size: stat.size });
+  } catch (e) {
+    if (e.status === 400) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET render — full PDF pipeline keyed by resume id (m2 iframe src targets this).
+// Reads from disk so the PDF reflects ground truth; ?v=ts is just a cache buster.
+app.get('/api/career/resumes/:id/render', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!validateResumeId(id)) return res.status(400).json({ error: 'invalid id' });
+    const idx = await readResumeIndex();
+    if (!idx.resumes.some(r => r.id === id)) return res.status(404).json({ error: 'not found' });
+
+    const [identity, metadata, content] = await Promise.all([
+      readIdentity().then(v => v ?? {}),
+      readResumeMetadata(id),
+      readResumeContent(id),
+    ]);
+    const body_html = markdownToTemplateHtml(content, { stripLeadingName: identity?.name });
+    const html = composeCvHtml({
+      identity,
+      body_html,
+      options: { accent_color: metadata.renderer?.accent_color },
+    });
+    const pdf = await htmlToPdf(html);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${id}.pdf"`);
+    res.send(pdf);
+  } catch (e) {
+    if (e.status === 400) return res.status(400).json({ error: e.message });
+    console.warn(`render/${req.params.id} failed:`, e.message);
+    res.status(503).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// Auto-select base resume — keyword scoring against a JD.
+// 03-cv-engine/04-auto-select. No LLM; transparent + free + deterministic.
+// Score = +1 per role_keyword matched in role + +1 per jd_keyword matched
+// in jd_text − 2 per negative_keyword matched in jd_text.
+// Ties broken by is_default first, then created_at ascending.
+// ─────────────────────────────────────────────────────────────
+
+const AutoSelectRequestSchema = z.object({
+  jd_text: z.string().max(50_000),
+  role: z.string().max(200).optional(),
+});
+
+// Lower-case substring match. Each keyword counted once even if it appears
+// multiple times — prevents JDs that repeat a word from inflating the score.
+function matchKeywords(haystack, keywords) {
+  if (!keywords || keywords.length === 0) return [];
+  const hay = haystack.toLowerCase();
+  const matched = [];
+  for (const kw of keywords) {
+    const k = String(kw).toLowerCase().trim();
+    if (k && hay.includes(k)) matched.push(kw);
+  }
+  return matched;
+}
+
+function scoreResumeAgainstJd(metadata, jd_text, role) {
+  const rules = metadata?.match_rules ?? {};
+  const role_text = role ?? '';
+  const role_matched = matchKeywords(role_text, rules.role_keywords);
+  const jd_matched = matchKeywords(jd_text, rules.jd_keywords);
+  const negative_matched = matchKeywords(jd_text, rules.negative_keywords);
+  const score = role_matched.length + jd_matched.length - 2 * negative_matched.length;
+  return {
+    score,
+    matched: {
+      role_keywords: role_matched,
+      jd_keywords: jd_matched,
+      negative_keywords: negative_matched,
+    },
+  };
+}
+
+function buildPickReason(top) {
+  const { score, matched, is_default } = top;
+  const role_n = matched.role_keywords.length;
+  const jd_n = matched.jd_keywords.length;
+  const neg_n = matched.negative_keywords.length;
+  if (score > 0) {
+    const parts = [];
+    if (role_n) parts.push(`${role_n} role keyword${role_n > 1 ? 's' : ''}`);
+    if (jd_n) parts.push(`${jd_n} jd keyword${jd_n > 1 ? 's' : ''}`);
+    let reason = `Matched ${parts.join(', ')}`;
+    if (neg_n) reason += `, ${neg_n} negative penalty`;
+    return reason;
+  }
+  if (score === 0) {
+    return is_default
+      ? 'No positive matches; using default resume'
+      : 'No positive matches; tie-broken by created_at';
+  }
+  return 'Best available has net-negative match; review match_rules';
+}
+
+app.post('/api/career/resumes/auto-select', async (req, res) => {
+  try {
+    const parsed = AutoSelectRequestSchema.parse(req.body);
+    const idx = await readResumeIndex();
+    if (idx.resumes.length === 0) {
+      return res.status(404).json({ error: 'No resumes registered' });
+    }
+
+    const rankings = [];
+    for (const r of idx.resumes) {
+      const md = await readResumeMetadata(r.id);
+      const { score, matched } = scoreResumeAgainstJd(md, parsed.jd_text, parsed.role);
+      rankings.push({
+        id: r.id,
+        title: r.title,
+        score,
+        matched,
+        is_default: r.is_default,
+        created_at: r.created_at,
+      });
+    }
+
+    rankings.sort((a, b) => {
+      if (a.score !== b.score) return b.score - a.score;
+      if (a.is_default !== b.is_default) return a.is_default ? -1 : 1;
+      return (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0);
+    });
+
+    const top = rankings[0];
+    const fallback_to_default = top.score <= 0 && top.is_default;
+
+    res.json({
+      picked: top.id,
+      picked_score: top.score,
+      picked_reason: buildPickReason(top),
+      fallback_to_default,
+      rankings,
+    });
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid auto-select request', details: e.issues });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Finder: scan trigger + status ─────────────────────────────────────
+app.post('/api/career/finder/scan', (_req, res) => {
+  try {
+    const { scan_id, started_at } = startScan();
+    res.status(202).json({ scan_id, started_at });
+  } catch (e) {
+    if (e instanceof ScanAlreadyRunningError) {
+      // Spread state FIRST so our error string isn't overwritten by
+      // e.state.error (which is the scan-level error field — usually null).
+      return res.status(409).json({
+        ...e.state,
+        error: 'scan already running',
+      });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/career/finder/scan/status', (_req, res) => {
+  res.json(getScanStatus());
+});
+
+// ─── Finder: per-source-type debug scan ────────────────────────────────
+// Triggers a scan filtered to one source-type, used by the scheduler UI's
+// "Run Now" button per-row. Same race-protection as the all-types /scan.
+const ScanSourceSchema = z.object({
+  type: z.enum(SOURCE_TYPES),
+});
+app.post('/api/career/finder/scan/source', (req, res) => {
+  let body;
+  try {
+    body = ScanSourceSchema.parse(req.body);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid type', details: e.issues });
+  }
+  try {
+    const { scan_id, started_at } = startScan({ types: [body.type] });
+    res.status(202).json({ scan_id, started_at, types: [body.type] });
+  } catch (e) {
+    if (e instanceof ScanAlreadyRunningError) {
+      // Spread state FIRST so our error string isn't overwritten by e.state.error.
+      return res.status(409).json({ ...e.state, error: 'scan already running' });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Finder: scheduler status (cadence + last_run + next_run per type) ─
+// One row per type that has either a cadence configured OR an active source
+// in portals.yml. UI consumes this to render the SchedulerPanel table.
+app.get('/api/career/finder/scheduler/status', async (_req, res) => {
+  try {
+    const portals = await readPortalsConfig();
+    const cadenceStr = portals?.scan_cadence ?? {};
+    const cadenceMs = cadenceToMs(cadenceStr);
+    const state = await readCadenceState();
+    const sources = Array.isArray(portals?.sources) ? portals.sources : [];
+    const activeTypeSet = new Set(sources.map((s) => s?.type).filter((t) => typeof t === 'string'));
+
+    // Union: types with a cadence config + types with at least one active source.
+    const allTypes = new Set([...Object.keys(cadenceStr), ...activeTypeSet]);
+    const rows = Array.from(allTypes).sort().map((type) => {
+      const ms = cadenceMs[type];
+      const entry = state[type] ?? {};
+      const lastRunMs = typeof entry.last_run_at === 'string' ? Date.parse(entry.last_run_at) : NaN;
+      const nextRunMs = !Number.isNaN(lastRunMs) && typeof ms === 'number'
+        ? lastRunMs + ms
+        : null;
+      return {
+        type,
+        cadence_str: cadenceStr[type] ?? null,
+        cadence_ms: typeof ms === 'number' ? ms : null,
+        cadence_valid: typeof ms === 'number',
+        last_run_at: entry.last_run_at ?? null,
+        next_run_at: nextRunMs != null ? new Date(nextRunMs).toISOString() : null,
+        last_outcome: entry.last_outcome ?? null,
+        last_jobs_count: entry.last_jobs_count ?? null,
+        last_error: entry.last_error ?? null,
+        has_active_source: activeTypeSet.has(type),
+      };
+    });
+    res.json({ rows, scan_status: getScanStatus() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Finder: pipeline.json read (paginated job list for Pipeline UI) ───
+// Returns the scanned + (optionally) evaluated jobs from data/career/
+// pipeline.json. Query params:
+//   q       — case-insensitive substring filter on company / role
+//   sort    — 'score' | 'posted_at' | 'scraped_at' | 'company' (default 'score')
+//   order   — 'asc' | 'desc' (default 'desc')
+//   limit   — page size (default 50, max 200)
+//   offset  — page offset (default 0)
+// Always returns { total, filtered, jobs[], last_scan_at } so the UI can
+// render pagination without a separate count round-trip.
+app.get('/api/career/finder/pipeline', async (req, res) => {
+  try {
+    if (!existsSync(PIPELINE_FILE)) {
+      return res.json({ total: 0, filtered: 0, jobs: [], last_scan_at: null });
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+    } catch {
+      return res.json({ total: 0, filtered: 0, jobs: [], last_scan_at: null });
+    }
+    const allJobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
+    const total = allJobs.length;
+
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+    const sortKey = ['score', 'posted_at', 'scraped_at', 'company'].includes(req.query.sort)
+      ? req.query.sort
+      : 'score';
+    const order = req.query.order === 'asc' ? 'asc' : 'desc';
+    const limit = Math.min(Math.max(1, Number(req.query.limit) || 50), 200);
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+
+    let jobs = allJobs;
+    if (q) {
+      jobs = jobs.filter((j) => {
+        const company = String(j.company ?? '').toLowerCase();
+        const role = String(j.role ?? '').toLowerCase();
+        return company.includes(q) || role.includes(q);
+      });
+    }
+    const filtered = jobs.length;
+
+    // Score for sort = Stage A score (Haiku); falls back to 0 when not yet
+    // evaluated. status=null jobs land at the bottom under DESC.
+    function scoreOf(j) {
+      const sa = j.evaluation?.stage_a?.score;
+      return Number.isFinite(sa) ? sa : -Infinity;
+    }
+    jobs = [...jobs].sort((a, b) => {
+      let cmp = 0;
+      if (sortKey === 'score') {
+        cmp = scoreOf(a) - scoreOf(b);
+      } else if (sortKey === 'posted_at' || sortKey === 'scraped_at') {
+        const aStr = String(a[sortKey] ?? '');
+        const bStr = String(b[sortKey] ?? '');
+        cmp = aStr < bStr ? -1 : aStr > bStr ? 1 : 0;
+      } else if (sortKey === 'company') {
+        const aStr = String(a.company ?? '').toLowerCase();
+        const bStr = String(b.company ?? '').toLowerCase();
+        cmp = aStr < bStr ? -1 : aStr > bStr ? 1 : 0;
+      }
+      return order === 'asc' ? cmp : -cmp;
+    });
+
+    const page = jobs.slice(offset, offset + limit);
+
+    // Trim each row to the UI-relevant subset — description + raw payload
+    // can be megabytes, no point shipping them for a table view.
+    const trimmed = page.map((j) => ({
+      id: j.id,
+      company: j.company,
+      role: j.role,
+      location: j.location,
+      url: j.url,
+      source: j.source ? { type: j.source.type, name: j.source.name } : null,
+      tags: j.tags,
+      comp_hint: j.comp_hint,
+      posted_at: j.posted_at,
+      scraped_at: j.scraped_at,
+      status: j.status,
+      evaluation: j.evaluation
+        ? {
+            stage_a: j.evaluation.stage_a
+              ? {
+                  score: j.evaluation.stage_a.score,
+                  verdict: j.evaluation.stage_a.verdict,
+                  reasoning: j.evaluation.stage_a.reasoning,
+                }
+              : null,
+            stage_b: j.evaluation.stage_b ? { score: j.evaluation.stage_b.score } : null,
+          }
+        : null,
+      needs_manual_enrich: !!j.needs_manual_enrich,
+    }));
+
+    res.json({
+      total,
+      filtered,
+      jobs: trimmed,
+      last_scan_at: parsed.last_scan_at ?? null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message ?? e).slice(0, 300) });
+  }
+});
+
+// ─── Finder: single job lookup ─────────────────────────────────────────
+// Returns one job from pipeline.json by id. The Mode 2 Apply page needs
+// the job's apply URL + role/company to start a multi-step machine.
+// Trims the heavy description/raw fields — only metadata is shipped.
+app.get('/api/career/finder/job/:jobId', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!existsSync(PIPELINE_FILE)) {
+      return res.status(404).json({ error: 'pipeline.json does not exist' });
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+    } catch {
+      return res.status(500).json({ error: 'pipeline.json unparseable' });
+    }
+    const jobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
+    const j = jobs.find((x) => x && x.id === jobId);
+    if (!j) {
+      return res.status(404).json({ error: `job not found in pipeline.json: ${jobId}` });
+    }
+    res.json({
+      id: j.id,
+      company: j.company,
+      role: j.role,
+      location: j.location,
+      url: j.url,
+      source: j.source ? { type: j.source.type, name: j.source.name } : null,
+      posted_at: j.posted_at,
+      status: j.status,
+      // Full JD body — safe to ship for a single job (the list endpoint
+      // trims it because 300 × 10KB would be a heavy payload).
+      description: j.description ?? null,
+      evaluation: j.evaluation
+        ? {
+            stage_a: j.evaluation.stage_a
+              ? { score: j.evaluation.stage_a.score, verdict: j.evaluation.stage_a.verdict }
+              : null,
+            stage_b: j.evaluation.stage_b ? { score: j.evaluation.stage_b.score } : null,
+          }
+        : null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message ?? e).slice(0, 300) });
+  }
+});
+
+// ─── Finder: re-filter raw-scan into pipeline.json ─────────────────────
+// find-jobs-redesign m1 follow-up: when the user changes hard_filters
+// (especially loosens them), the dedupe logic in scanRunner.mjs blocks
+// previously-seen job ids from re-entering pipeline.json — so loosened
+// filters never take effect without a manual `rm scan-history.jsonl`.
+// This endpoint solves that explicitly:
+//   1. Read data/career/raw-scan/latest.json (every job from the latest scan)
+//   2. Apply CURRENT hard_filters to all of them
+//   3. Rewrite data/career/pipeline.json with the kept set (replace)
+//   4. Truncate scan-history.jsonl so future scans don't re-dedupe these
+//      back out on the next pipeline.json write
+//
+// No ATS API calls. Synchronous, fast (~50ms for 3k jobs).
+app.post('/api/career/finder/refilter', async (_req, res) => {
+  try {
+    const { RAW_SCAN_LATEST, PIPELINE_FILE: PF, isPipelineBusy } = await import(
+      './src/career/finder/scanRunner.mjs'
+    );
+    if (typeof isPipelineBusy === 'function' && isPipelineBusy()) {
+      return res
+        .status(409)
+        .json({ error: 'A scan or enrich is currently writing pipeline.json. Try again in a few seconds.' });
+    }
+    if (!existsSync(RAW_SCAN_LATEST)) {
+      return res
+        .status(404)
+        .json({ error: 'No raw-scan/latest.json yet. Run a scan first (Find Jobs → ① Sources → Scan now).' });
+    }
+    let raw;
+    try {
+      raw = JSON.parse(await fs.readFile(RAW_SCAN_LATEST, 'utf-8'));
+    } catch (e) {
+      return res
+        .status(500)
+        .json({ error: `raw-scan/latest.json unparseable: ${String(e?.message ?? e).slice(0, 200)}` });
+    }
+    const rawJobs = Array.isArray(raw?.jobs) ? raw.jobs : [];
+    if (rawJobs.length === 0) {
+      return res.json({ ok: true, raw_count: 0, kept: 0, dropped: 0, dropped_per_rule: {} });
+    }
+
+    const prefs = await readPreferences();
+    const { applyHardFilterBatch } = await import('./src/career/finder/hardFilter.mjs');
+    const { kept, dropped } = applyHardFilterBatch(rawJobs, prefs);
+
+    const droppedPerRule = {};
+    for (const d of dropped) {
+      const r = d.rule_id || 'unknown';
+      droppedPerRule[r] = (droppedPerRule[r] || 0) + 1;
+    }
+
+    // Write pipeline.json — replace entire kept-jobs list with the
+    // refilter result. Preserve scan_summary if present so the UI keeps
+    // the "X raw jobs from N sources" header.
+    let existingSummary = [];
+    try {
+      if (existsSync(PF)) {
+        const p = JSON.parse(await fs.readFile(PF, 'utf-8'));
+        if (Array.isArray(p?.scan_summary)) existingSummary = p.scan_summary;
+      }
+    } catch {
+      /* fail-soft */
+    }
+
+    // Strip the raw-scan tagging fields before writing — pipeline.json
+    // entries should have their original shape (no _passed/_dropped_by).
+    const cleanedKept = kept.map((j) => {
+      const { _passed, _dropped_by, _dropped_detail, ...rest } = j;
+      void _passed;
+      void _dropped_by;
+      void _dropped_detail;
+      return rest;
+    });
+
+    const tmpPath = PF + `.tmp.${process.pid}`;
+    await fs.writeFile(
+      tmpPath,
+      JSON.stringify(
+        {
+          last_scan_at: raw.last_scan_at || new Date().toISOString(),
+          jobs: cleanedKept,
+          scan_summary: existingSummary,
+          totals: {
+            per_run: {
+              total_input: rawJobs.length,
+              total_kept: cleanedKept.length,
+              total_dropped: dropped.length,
+              dropped_per_rule: droppedPerRule,
+              refilter: true,
+            },
+            aggregate: {
+              total_kept: cleanedKept.length,
+              needs_manual_count: 0,
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      'utf-8',
+    );
+    await fs.rename(tmpPath, PF);
+
+    // Truncate scan-history.jsonl so the NEXT actual scan won't dedupe
+    // these ids back out (which would overwrite our pipeline.json with
+    // an empty kept set on the next scheduler tick).
+    const { SCAN_HISTORY_FILE } = await import('./src/career/finder/dedupe.mjs');
+    let historyTruncated = false;
+    try {
+      if (existsSync(SCAN_HISTORY_FILE)) {
+        await fs.writeFile(SCAN_HISTORY_FILE, '', 'utf-8');
+        historyTruncated = true;
+      }
+    } catch (e) {
+      // Best-effort: pipeline.json is correct, the user just won't get
+      // re-evaluation on next scan. Log + continue.
+      console.warn('[refilter] failed to truncate scan-history.jsonl:', e?.message);
+    }
+
+    return res.json({
+      ok: true,
+      raw_count: rawJobs.length,
+      kept: cleanedKept.length,
+      dropped: dropped.length,
+      dropped_per_rule: droppedPerRule,
+      scan_history_truncated: historyTruncated,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message ?? e).slice(0, 300) });
+  }
+});
+
+// ─── Finder: raw-scan/latest.json read (drill-in view for Find Jobs UI) ─
+// Returns every job from the latest scan, tagged with _passed / _dropped_by /
+// _dropped_detail so the UI can show "what got filtered and why" alongside
+// passing jobs. Query params:
+//   q       — case-insensitive substring filter on company / role
+//   source  — exact match on source.name (e.g. 'Anthropic')
+//   status  — 'all' | 'passed' | 'dropped' (default 'all')
+//   limit   — page size (default 60, max 300)
+//   offset  — page offset (default 0)
+app.get('/api/career/finder/raw-jobs', async (req, res) => {
+  try {
+    const { RAW_SCAN_LATEST } = await import('./src/career/finder/scanRunner.mjs');
+    if (!existsSync(RAW_SCAN_LATEST)) {
+      return res.json({
+        total: 0,
+        passed: 0,
+        dropped: 0,
+        filtered: 0,
+        jobs: [],
+        sources: [],
+        dropped_by_rule: {},
+        last_scan_at: null,
+      });
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(await fs.readFile(RAW_SCAN_LATEST, 'utf-8'));
+    } catch {
+      return res.json({
+        total: 0,
+        passed: 0,
+        dropped: 0,
+        filtered: 0,
+        jobs: [],
+        sources: [],
+        dropped_by_rule: {},
+        last_scan_at: null,
+      });
+    }
+    const allJobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
+
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().toLowerCase() : '';
+    const source = typeof req.query.source === 'string' ? req.query.source.trim() : '';
+    const status = ['all', 'passed', 'dropped'].includes(req.query.status)
+      ? req.query.status
+      : 'all';
+    const limit = Math.min(Math.max(1, Number(req.query.limit) || 60), 300);
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+
+    let jobs = allJobs;
+    if (status === 'passed') jobs = jobs.filter((j) => j._passed === true);
+    else if (status === 'dropped') jobs = jobs.filter((j) => j._passed === false);
+    if (source) jobs = jobs.filter((j) => j.source && j.source.name === source);
+    if (q) {
+      jobs = jobs.filter((j) => {
+        const c = String(j.company ?? '').toLowerCase();
+        const r = String(j.role ?? '').toLowerCase();
+        return c.includes(q) || r.includes(q);
+      });
+    }
+
+    const filtered = jobs.length;
+    const page = jobs.slice(offset, offset + limit);
+    const trimmed = page.map((j) => ({
+      id: j.id,
+      company: j.company,
+      role: j.role,
+      location: j.location,
+      url: j.url,
+      source: j.source ? { type: j.source.type, name: j.source.name } : null,
+      tags: j.tags,
+      comp_hint: j.comp_hint,
+      posted_at: j.posted_at,
+      scraped_at: j.scraped_at,
+      _passed: j._passed,
+      _dropped_by: j._dropped_by,
+      _dropped_detail: j._dropped_detail,
+    }));
+
+    const sources = Array.from(
+      new Set(allJobs.map((j) => j.source?.name).filter((n) => typeof n === 'string')),
+    ).sort();
+
+    res.json({
+      total: parsed?.total ?? allJobs.length,
+      passed: parsed?.passed ?? allJobs.filter((j) => j._passed).length,
+      dropped: parsed?.dropped ?? allJobs.filter((j) => !j._passed).length,
+      dropped_by_rule: parsed?.dropped_by_rule ?? {},
+      filtered,
+      jobs: trimmed,
+      sources,
+      last_scan_at: parsed?.last_scan_at ?? null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message ?? e).slice(0, 300) });
+  }
+});
+
+// ─── Finder: portals test endpoint ─────────────────────────────────────
+// Validates a Portals page URL by parsing → calling the matching adapter's
+// fetch with a tight timeout → sampling the first 3 titles. Returns either:
+//   { ok: true, type, config, count, sample_titles: [string], duration_ms }
+//   { ok: false, type?, config?, error }
+// Used by the new URL-input UI in Settings → Portals so the user gets
+// instant feedback whether their pasted URL actually returns jobs.
+app.get('/api/career/finder/portals/test', async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const url = typeof req.query.url === 'string' ? req.query.url : '';
+    if (!url) {
+      return res.status(400).json({ ok: false, error: 'Missing ?url= param' });
+    }
+    const { parsePortalUrl } = await import('./src/career/finder/parsePortalUrl.mjs');
+    const parsed = parsePortalUrl(url);
+    if ('error' in parsed) {
+      return res.status(200).json({ ok: false, error: parsed.error });
+    }
+    const { getAdapter } = await import('./src/career/finder/scanRunner.mjs');
+    const adapter = getAdapter(parsed.type);
+    if (!adapter || typeof adapter.fetch !== 'function') {
+      return res
+        .status(200)
+        .json({ ok: false, type: parsed.type, config: parsed.config, error: `No adapter for type "${parsed.type}"` });
+    }
+    // Race the adapter fetch against a 15s wall-time cap. Some sources
+    // (github-md from China) routinely hit 60s and we don't want the UI
+    // to hang waiting for a verdict.
+    const TEST_TIMEOUT_MS = 15_000;
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Test fetch exceeded ${TEST_TIMEOUT_MS / 1000}s`)), TEST_TIMEOUT_MS);
+    });
+    let rawJobs;
+    try {
+      rawJobs = await Promise.race([adapter.fetch(parsed.config), timeout]);
+    } catch (e) {
+      clearTimeout(timer);
+      return res.status(200).json({
+        ok: false,
+        type: parsed.type,
+        config: parsed.config,
+        error: String(e?.message ?? e).slice(0, 300),
+        duration_ms: Date.now() - t0,
+      });
+    }
+    clearTimeout(timer);
+    const count = Array.isArray(rawJobs) ? rawJobs.length : 0;
+    // Pull title from whatever shape this adapter returns.
+    const sample_titles = (Array.isArray(rawJobs) ? rawJobs.slice(0, 3) : [])
+      .map((r) => {
+        if (!r || typeof r !== 'object') return null;
+        // Greenhouse: r.title  · Ashby: r.title  · Lever: r.text  · github-md: r.role
+        return r.title || r.text || r.role || r.name || null;
+      })
+      .filter(Boolean)
+      .map((s) => String(s).slice(0, 80));
+    return res.json({
+      ok: true,
+      type: parsed.type,
+      config: parsed.config,
+      count,
+      sample_titles,
+      duration_ms: Date.now() - t0,
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message ?? e).slice(0, 300) });
+  }
+});
+
+// ─── Finder: portals.yml CRUD ──────────────────────────────────────────
+app.get('/api/career/finder/portals', async (_req, res) => {
+  try {
+    const cfg = await readPortalsConfig();
+    res.json(cfg);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/career/finder/portals', async (req, res) => {
+  try {
+    await writePortalsConfig(req.body);
+    res.json({ ok: true });
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid portals config', details: e.issues });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Finder: manual JD enrich retry ────────────────────────────────────
+// Re-runs the 4-tier enrich (skip → ATS → Playwright → manual flag) against
+// the current pipeline.json's kept jobs. Used after a scan to retry the
+// jobs that landed with needs_manual_enrich=true, or to enrich freshly
+// added manual-paste jobs that have description=null. Returns counters.
+// Refuses (409) if a scan is in flight to avoid pipeline.json races.
+app.post('/api/career/finder/enrich', async (_req, res) => {
+  // Acquire the pipeline-enrich lock BEFORE any I/O. The lock blocks
+  // startScan() too, so a scan can't land a fresh pipeline.json mid-enrich
+  // and have it overwritten by our stale snapshot at the end.
+  const lock = acquirePipelineEnrichLock();
+  if (!lock.ok) {
+    return res.status(409).json({
+      error: lock.reason === 'scan_running'
+        ? 'scan in progress; enrich would race the scan write'
+        : 'another enrich is already running',
+    });
+  }
+  try {
+    if (!existsSync(PIPELINE_FILE)) {
+      return res.json({
+        total: 0,
+        enriched_now: 0,
+        still_needs_manual: 0,
+        ats_hits: 0,
+        scrape_hits: 0,
+      });
+    }
+    let pipeline;
+    try {
+      pipeline = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+    } catch {
+      return res.status(500).json({ error: 'pipeline.json unparseable' });
+    }
+    const jobs = Array.isArray(pipeline?.jobs) ? pipeline.jobs : [];
+    // Mirror scanRunner's enrichBatch behavior: any job that shouldEnrich
+    // (description ≤ 500 chars) OR explicitly flagged needs_manual_enrich.
+    // Pre-m3 pipeline entries with a short ATS snippet would otherwise be
+    // skipped forever by /enrich while a fresh scan would re-enrich them.
+    const candidates = jobs.filter(
+      (j) => j && (j.needs_manual_enrich === true || shouldEnrich(j))
+    );
+    const counters = await enrichBatch(candidates, { concurrency: 3 });
+    // candidates entries are the same references as pipeline.jobs entries —
+    // mutation already landed; just write the whole pipeline back.
+    pipeline.jobs = jobs;
+    await atomicWriteFile(PIPELINE_FILE, JSON.stringify(pipeline, null, 2));
+    res.json({
+      total: candidates.length,
+      enriched_now: counters.enriched,
+      still_needs_manual: counters.needs_manual,
+      ats_hits: counters.ats_hits,
+      scrape_hits: counters.scrape_hits,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  } finally {
+    releasePipelineEnrichLock();
+  }
+});
+
+// ─── Finder: needs-manual list (UI feeds off this) ─────────────────────
+// Returns the subset of pipeline.json kept jobs that the 4-tier enrich
+// flagged as needing manual JD paste. UI under /career/shortlist/needs-manual
+// renders these with a paste textarea per row.
+app.get('/api/career/finder/needs-manual', async (_req, res) => {
+  try {
+    if (!existsSync(PIPELINE_FILE)) return res.json({ jobs: [] });
+    let pipeline;
+    try {
+      pipeline = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+    } catch {
+      return res.status(500).json({ error: 'pipeline.json unparseable' });
+    }
+    const jobs = Array.isArray(pipeline?.jobs) ? pipeline.jobs : [];
+    // Project to a smaller view shape for the UI — full Job has raw and other
+    // bulky fields the list doesn't need.
+    const out = jobs
+      .filter((j) => j && j.needs_manual_enrich === true)
+      .map((j) => ({
+        id: j.id,
+        company: j.company,
+        role: j.role,
+        url: j.url,
+        location: j.location,
+        posted_at: j.posted_at ?? null,
+        source: j.source ?? null,
+      }));
+    res.json({ jobs: out });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Pipeline: PATCH a single job's description (manual JD paste) ──────
+// Used by the needs-manual UI when the user pastes JD text for a job that
+// the enricher couldn't fetch automatically. 409s if a scan or enrich is
+// running so the write doesn't race their pipeline.json snapshot.
+const JobDescriptionPatchSchema = z.object({
+  description: z.string().min(10).max(50_000),
+});
+
+app.patch('/api/career/pipeline/job/:id/description', async (req, res) => {
+  const status = getScanStatus();
+  if (status.running || status.enriching) {
+    return res.status(409).json({
+      error: status.running
+        ? 'scan in progress; PATCH would race the scan write'
+        : 'enrich in progress; PATCH would race the enrich write',
+    });
+  }
+  try {
+    const body = JobDescriptionPatchSchema.parse(req.body);
+    if (!existsSync(PIPELINE_FILE)) {
+      return res.status(404).json({ error: 'pipeline.json does not exist' });
+    }
+    let pipeline;
+    try {
+      pipeline = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+    } catch {
+      return res.status(500).json({ error: 'pipeline.json unparseable' });
+    }
+    const jobs = Array.isArray(pipeline?.jobs) ? pipeline.jobs : [];
+    const job = jobs.find((j) => j && j.id === req.params.id);
+    if (!job) return res.status(404).json({ error: 'job not found' });
+    job.description = body.description;
+    job.needs_manual_enrich = false;
+    await atomicWriteFile(PIPELINE_FILE, JSON.stringify(pipeline, null, 2));
+    res.json({
+      ok: true,
+      job: {
+        id: job.id,
+        description: job.description,
+        needs_manual_enrich: job.needs_manual_enrich,
+      },
+    });
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid description', details: e.issues });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Evaluator: Stage A (Haiku) batch endpoint ─────────────────────────
+// Runs evaluateJobsStageA against currently-pending pipeline jobs (or a
+// caller-supplied jobIds subset). Mutates pipeline.json::jobs[i].evaluation
+// in place; idempotent (skips jobs that already have a stage_a entry).
+//
+// 4-way pipelineMutex from earlier rooms is now 5-way: scan + enrich +
+// manual-paste + PATCH /:id/description + this. All five acquire the same
+// lock — runs are serialized to avoid pipeline.json overwrite races.
+const EvaluateStageABodySchema = z.object({
+  jobIds: z.array(z.string().min(1)).optional().nullable(),
+});
+
+// Reads the user's default resume's base.md and returns its content as the
+// simplifiedCv input to Stage A's prompt builder. m1's prompt builder
+// already trims to 1500 chars in the system block, so no need to extract
+// here. If no default resume exists OR base.md is missing, returns ''
+// (m1 prompt handles this gracefully with "(no CV summary available)").
+async function readSimplifiedCvForStageA() {
+  try {
+    const idx = await readResumeIndex();
+    const def = (idx?.resumes ?? []).find((r) => r && r.is_default === true);
+    if (!def) return '';
+    const baseMd = path.join(resolveResumeDir(def.id), 'base.md');
+    if (!existsSync(baseMd)) return '';
+    const raw = await fs.readFile(baseMd, 'utf-8');
+    return typeof raw === 'string' ? raw : '';
+  } catch (e) {
+    console.warn('[stage-a] simplifiedCv read failed:', String(e?.message ?? e).slice(0, 200));
+    return '';
+  }
+}
+
+// ─── Evaluator: Stage A status + projected results for the UI ──────────
+// UI consumes this to render the Pipeline-tab StageABatch panel:
+// pending count drives the "Run Stage A on N pending" button enabled state;
+// `results` shows recently-evaluated jobs sorted by score desc (top 50).
+// Returning a projection (not full Job objects) keeps the payload small.
+app.get('/api/career/evaluate/stage-a/results', async (_req, res) => {
+  try {
+    if (!existsSync(PIPELINE_FILE)) {
+      return res.json({ pending: 0, total: 0, results: [] });
+    }
+    let pipeline;
+    try {
+      pipeline = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+    } catch {
+      return res.status(500).json({ error: 'pipeline.json unparseable' });
+    }
+    const jobs = Array.isArray(pipeline?.jobs) ? pipeline.jobs : [];
+    const pending = jobs.filter((j) => j && j.evaluation?.stage_a == null).length;
+    const evaluated = jobs.filter((j) => j && j.evaluation?.stage_a != null);
+    // Sort by score desc; archived/error rows fall to the bottom (null score
+    // → -Infinity).
+    evaluated.sort((a, b) => {
+      const sa = a.evaluation.stage_a.score ?? -Infinity;
+      const sb = b.evaluation.stage_a.score ?? -Infinity;
+      return sb - sa;
+    });
+    const results = evaluated.slice(0, 50).map((j) => ({
+      id: j.id,
+      company: j.company,
+      role: j.role,
+      url: j.url,
+      location: j.location,
+      score: j.evaluation.stage_a.score,
+      reason: j.evaluation.stage_a.reason,
+      status: j.evaluation.stage_a.status,
+      evaluated_at: j.evaluation.stage_a.evaluated_at,
+      cost_usd: j.evaluation.stage_a.cost_usd,
+      error: j.evaluation.stage_a.error ?? null,
+    }));
+    res.json({
+      total: jobs.length,
+      pending,
+      evaluated_count: evaluated.length,
+      results,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/career/evaluate/stage-a', async (req, res) => {
+  // Acquire the pipeline mutex BEFORE any I/O. Blocks scan-start, /enrich,
+  // and /scan/source the same way they block each other; symmetric.
+  const lock = acquirePipelineEnrichLock();
+  if (!lock.ok) {
+    return res.status(409).json({
+      error:
+        lock.reason === 'scan_running'
+          ? 'scan in progress; Stage A would race the scan write'
+          : 'another pipeline writer is running (enrich or earlier evaluate)',
+    });
+  }
+  try {
+    let body;
+    try {
+      body = EvaluateStageABodySchema.parse(req.body ?? {});
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid body', details: e.issues });
+    }
+
+    if (!existsSync(PIPELINE_FILE)) {
+      return res.status(404).json({ error: 'pipeline.json does not exist' });
+    }
+    let pipeline;
+    try {
+      pipeline = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+    } catch {
+      return res.status(500).json({ error: 'pipeline.json unparseable' });
+    }
+    const jobs = Array.isArray(pipeline?.jobs) ? pipeline.jobs : [];
+
+    let candidates;
+    if (Array.isArray(body.jobIds) && body.jobIds.length > 0) {
+      const wanted = new Set(body.jobIds);
+      candidates = jobs.filter((j) => j && wanted.has(j.id));
+    } else {
+      // All pending = no Stage A entry yet. Errored jobs (status === 'error')
+      // are NOT auto-retried — m4 UI clears the field first to retry.
+      candidates = jobs.filter((j) => j && (j.evaluation?.stage_a == null));
+    }
+
+    if (candidates.length === 0) {
+      return res.json({
+        total: 0,
+        evaluated: 0,
+        archived: 0,
+        errors: 0,
+        skipped: 0,
+        total_cost_usd: 0,
+      });
+    }
+
+    const prefs = await readPreferences();
+    const simplifiedCv = await readSimplifiedCvForStageA();
+    const result = await evaluateJobsStageA(candidates, prefs, { simplifiedCv });
+
+    // Map results back to jobs by id and mutate evaluation.stage_a in place.
+    // Spread the existing evaluation object so future stage_b siblings
+    // (06-evaluator/02) aren't clobbered.
+    const evaluatedAt = new Date().toISOString();
+    const resultsById = new Map(result.results.map((r) => [r.jobId, r]));
+    for (const job of candidates) {
+      const r = resultsById.get(job.id);
+      if (!r) continue;
+      const stageA = {
+        score: r.score ?? null,
+        reason: r.reason ?? null,
+        model: r.model,
+        evaluated_at: evaluatedAt,
+        cost_usd: r.cost_usd ?? 0,
+        status: r.status,
+      };
+      if (r.error) stageA.error = String(r.error).slice(0, 500);
+      job.evaluation = { ...(job.evaluation ?? {}), stage_a: stageA };
+    }
+
+    await atomicWriteFile(PIPELINE_FILE, JSON.stringify(pipeline, null, 2));
+
+    res.json({
+      total: candidates.length,
+      evaluated: result.evaluated,
+      archived: result.archived,
+      errors: result.errors,
+      skipped: result.skipped,
+      total_cost_usd: result.total_cost_usd,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  } finally {
+    releasePipelineEnrichLock();
+  }
+});
+
+// ─── Evaluator: Stage B (Sonnet) batch endpoint ────────────────────────
+// Runs evaluateJobsStageB against stage-A-passing pending jobs (or a
+// caller-supplied jobIds subset). Threshold-gated: only jobs with
+// stage_a.score >= prefs.thresholds.consider get the $0.30 deep eval.
+//
+// Mutex pattern matches Stage A — pipelineMutex is now 6-way: scan +
+// enrich + manual-paste + PATCH /:id/description + /evaluate/stage-a +
+// /evaluate/stage-b. All six serialize via the same lock.
+//
+// Mutation: spread {...evaluation, stage_b: r} preserves the stage_a
+// sibling. The runner has already written the report markdown atomically
+// to data/career/reports/{jobId}.md before returning.
+const EvaluateStageBBodySchema = z.object({
+  jobIds: z.array(z.string().min(1)).optional().nullable(),
+  // 04-budget-gate m2: explicit override of the daily-budget gate. Strict
+  // boolean — Zod rejects 'truthy-string' / 1 / null. Cost STILL records
+  // on force runs (constraint #3 — no white-label channel).
+  force: z.boolean().optional(),
+});
+
+// Threshold default lives in prefs.thresholds.consider; if missing or
+// non-numeric, fall back to 3.5 (matches stage-a-haiku Room defaults).
+function resolveStageBConsiderThreshold(prefs) {
+  const v = Number(prefs?.thresholds?.consider);
+  return Number.isFinite(v) ? v : 3.5;
+}
+
+// JobSchema.id regex; reused at the report-serving endpoint as a
+// path-traversal guard (defense in depth — runner already validates).
+const JOB_ID_PATH_RE = /^[a-f0-9]{12}$/;
+
+// ─── Stage B: results projection for the UI ─────────────────────────────
+app.get('/api/career/evaluate/stage-b/results', async (_req, res) => {
+  try {
+    if (!existsSync(PIPELINE_FILE)) {
+      return res.json({ pending: 0, total: 0, evaluated_count: 0, results: [] });
+    }
+    let pipeline;
+    try {
+      pipeline = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+    } catch {
+      return res.status(500).json({ error: 'pipeline.json unparseable' });
+    }
+    const jobs = Array.isArray(pipeline?.jobs) ? pipeline.jobs : [];
+    const prefs = await readPreferences();
+    const threshold = resolveStageBConsiderThreshold(prefs);
+
+    // Pending = stage_a evaluated, score >= threshold, AND stage_b == null
+    const pending = jobs.filter(
+      (j) =>
+        j &&
+        j.evaluation?.stage_a?.status === 'evaluated' &&
+        (j.evaluation.stage_a.score ?? 0) >= threshold &&
+        j.evaluation.stage_b == null
+    ).length;
+
+    const evaluated = jobs.filter((j) => j && j.evaluation?.stage_b != null);
+    evaluated.sort((a, b) => {
+      const sa = a.evaluation.stage_b.total_score ?? -Infinity;
+      const sb = b.evaluation.stage_b.total_score ?? -Infinity;
+      return sb - sa;
+    });
+    const results = evaluated.slice(0, 50).map((j) => ({
+      id: j.id,
+      company: j.company,
+      role: j.role,
+      url: j.url,
+      location: j.location,
+      total_score: j.evaluation.stage_b.total_score,
+      blocks_emitted: j.evaluation.stage_b.blocks_emitted ?? [],
+      report_path: j.evaluation.stage_b.report_path,
+      status: j.evaluation.stage_b.status,
+      evaluated_at: j.evaluation.stage_b.evaluated_at,
+      cost_usd: j.evaluation.stage_b.cost_usd,
+      web_search_requests: j.evaluation.stage_b.web_search_requests ?? 0,
+      tool_rounds_used: j.evaluation.stage_b.tool_rounds_used ?? 0,
+      error: j.evaluation.stage_b.error ?? null,
+    }));
+    res.json({
+      total: jobs.length,
+      pending,
+      evaluated_count: evaluated.length,
+      threshold,
+      results,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Shortlist: GET /api/career/shortlist ──────────────────────────────
+// 06-evaluator/05-pipeline-ui m2: projection over jobs with successfully-
+// evaluated stage_b at total_score >= score_floor (default
+// prefs.thresholds.worth ?? 4.0). Sorted desc by total_score with
+// evaluated_at desc as tiebreaker. Top 100 cap.
+//
+// Read-only — no mutations. Pure projection over pipeline.json + a
+// single readdir on data/career/output/ to derive `has_tailor_output`
+// per row.
+const SHORTLIST_TOP_CAP = 100;
+
+app.get('/api/career/shortlist', async (_req, res) => {
+  try {
+    if (!existsSync(PIPELINE_FILE)) {
+      return res.json({ total: 0, score_floor: 4.0, results: [] });
+    }
+    let pipeline;
+    try {
+      pipeline = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+    } catch {
+      return res.status(500).json({ error: 'pipeline.json unparseable' });
+    }
+    const jobs = Array.isArray(pipeline?.jobs) ? pipeline.jobs : [];
+
+    // score_floor = prefs.thresholds.worth ?? 4.0
+    let scoreFloor = 4.0;
+    try {
+      const prefs = await readPreferences();
+      const v = Number(prefs?.thresholds?.worth);
+      if (Number.isFinite(v) && v >= 0) scoreFloor = v;
+    } catch {
+      // Corrupt prefs — keep $4.0 default; same fallback as /budget
+    }
+
+    // Build a Set of jobIds that have any tailored output file. One readdir.
+    const tailoredJobIds = new Set();
+    if (existsSync(TAILOR_OUTPUT_DIR)) {
+      try {
+        const files = await fs.readdir(TAILOR_OUTPUT_DIR);
+        for (const f of files) {
+          // output/{jobId}-{resumeId}.md format
+          const m = f.match(/^([a-f0-9]{12})-[a-z0-9-]+\.md$/);
+          if (m) tailoredJobIds.add(m[1]);
+        }
+      } catch {
+        // ignore — has_tailor_output stays false
+      }
+    }
+
+    const qualifying = jobs.filter(
+      (j) =>
+        j &&
+        j.evaluation?.stage_b?.status === 'evaluated' &&
+        typeof j.evaluation.stage_b.total_score === 'number' &&
+        j.evaluation.stage_b.total_score >= scoreFloor
+    );
+
+    qualifying.sort((a, b) => {
+      const sb = b.evaluation.stage_b.total_score - a.evaluation.stage_b.total_score;
+      if (sb !== 0) return sb;
+      // evaluated_at desc tiebreaker (lexical compare on ISO strings)
+      const ea = a.evaluation.stage_b.evaluated_at ?? '';
+      const eb = b.evaluation.stage_b.evaluated_at ?? '';
+      if (eb < ea) return -1;
+      if (eb > ea) return 1;
+      return 0;
+    });
+
+    const results = qualifying.slice(0, SHORTLIST_TOP_CAP).map((j) => ({
+      id: j.id,
+      company: j.company,
+      role: j.role,
+      url: j.url,
+      location: j.location,
+      total_score: j.evaluation.stage_b.total_score,
+      blocks_emitted: j.evaluation.stage_b.blocks_emitted ?? [],
+      report_path: j.evaluation.stage_b.report_path,
+      evaluated_at: j.evaluation.stage_b.evaluated_at,
+      cost_usd: j.evaluation.stage_b.cost_usd ?? 0,
+      stage_a_score: j.evaluation?.stage_a?.score ?? null,
+      has_tailor_output: tailoredJobIds.has(j.id),
+    }));
+
+    res.json({
+      total: qualifying.length,
+      score_floor: scoreFloor,
+      results,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Stage B: serve report markdown to the UI ──────────────────────────
+// GET /api/career/evaluate/stage-b/report/:jobId
+// Validates jobId against the canonical regex, then reads the file from
+// disk. The on-disk path is computed from the validated jobId — we IGNORE
+// the report_path field stored in pipeline.json to defeat any path-traversal
+// attempt via a hand-edited or compromised pipeline.json (e.g.
+// report_path: '/etc/passwd' or '../../secret').
+const STAGE_B_REPORTS_DIR = path.resolve('data', 'career', 'reports');
+
+app.get('/api/career/evaluate/stage-b/report/:jobId', async (req, res) => {
+  const jobId = req.params?.jobId;
+  if (typeof jobId !== 'string' || !JOB_ID_PATH_RE.test(jobId)) {
+    return res.status(400).json({ error: 'invalid jobId' });
+  }
+  try {
+    if (!existsSync(PIPELINE_FILE)) {
+      return res.status(404).json({ error: 'pipeline.json does not exist' });
+    }
+    let pipeline;
+    try {
+      pipeline = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+    } catch {
+      return res.status(500).json({ error: 'pipeline.json unparseable' });
+    }
+    const jobs = Array.isArray(pipeline?.jobs) ? pipeline.jobs : [];
+    const job = jobs.find((j) => j && j.id === jobId);
+    if (!job) return res.status(404).json({ error: 'job not found' });
+    const stageB = job.evaluation?.stage_b;
+    if (!stageB || !stageB.report_path) {
+      return res.status(404).json({ error: 'no stage_b report for this job' });
+    }
+
+    // Build path from validated jobId (NOT from stored report_path) and
+    // verify the resolved path stays inside REPORTS_DIR (defense in depth).
+    const reportFile = path.join(STAGE_B_REPORTS_DIR, `${jobId}.md`);
+    if (!reportFile.startsWith(STAGE_B_REPORTS_DIR + path.sep)) {
+      return res.status(400).json({ error: 'invalid report path' });
+    }
+    if (!existsSync(reportFile)) {
+      return res.status(404).json({ error: 'report file missing on disk' });
+    }
+    const content = await fs.readFile(reportFile, 'utf-8');
+    res.json({
+      content,
+      evaluated_at: stageB.evaluated_at,
+      total_score: stageB.total_score ?? null,
+      blocks_emitted: stageB.blocks_emitted ?? [],
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Stage B: POST /evaluate/stage-b — run deep eval batch ──────────────
+app.post('/api/career/evaluate/stage-b', async (req, res) => {
+  // Acquire pipelineMutex BEFORE any I/O. Same lock as scan / enrich /
+  // manual-paste / PATCH / stage-a — the 6-way mutex.
+  const lock = acquirePipelineEnrichLock();
+  if (!lock.ok) {
+    return res.status(409).json({
+      error:
+        lock.reason === 'scan_running'
+          ? 'scan in progress; Stage B would race the scan write'
+          : 'another pipeline writer is running (enrich, stage-a, or stage-b)',
+    });
+  }
+  try {
+    let body;
+    try {
+      body = EvaluateStageBBodySchema.parse(req.body ?? {});
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid body', details: e.issues });
+    }
+
+    // 04-budget-gate m2: pre-call gate. Inserted AFTER body parse (so 400
+    // zod errors take precedence) and BEFORE pipeline.json read (no I/O
+    // waste when paused). body.force === true bypasses; cost still records
+    // via runner (constraint #3 — no white-label channel).
+    if (body.force !== true) {
+      const gate = await checkBudgetGate();
+      if (gate.paused) {
+        return res.status(402).json({
+          error: 'daily_budget_usd reached for Stage B',
+          banner_message: gate.banner_message,
+          today_total_usd: gate.today_total_usd,
+          daily_budget_usd: gate.daily_budget_usd,
+        });
+      }
+    }
+
+    if (!existsSync(PIPELINE_FILE)) {
+      return res.status(404).json({ error: 'pipeline.json does not exist' });
+    }
+    let pipeline;
+    try {
+      pipeline = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+    } catch {
+      return res.status(500).json({ error: 'pipeline.json unparseable' });
+    }
+    const jobs = Array.isArray(pipeline?.jobs) ? pipeline.jobs : [];
+
+    const prefs = await readPreferences();
+    const threshold = resolveStageBConsiderThreshold(prefs);
+
+    let candidates;
+    if (Array.isArray(body.jobIds) && body.jobIds.length > 0) {
+      // jobIds-supplied path: pick exactly those (skip stage_a/threshold gate
+      // — caller is explicitly requesting). When body.force is also true,
+      // clear stage_b in-memory on those candidates so the runner's
+      // shouldEvaluate skip-if-evaluated guard doesn't short-circuit a
+      // user-requested Force Re-eval (05-pipeline-ui m1). Without force,
+      // runner's idempotency still skips anything already with stage_b set.
+      const wanted = new Set(body.jobIds);
+      candidates = jobs.filter((j) => j && wanted.has(j.id));
+      if (body.force === true) {
+        for (const j of candidates) {
+          if (j.evaluation && j.evaluation.stage_b != null) {
+            j.evaluation = { ...j.evaluation, stage_b: null };
+          }
+        }
+      }
+    } else {
+      // All-pending path: stage_a evaluated AND score >= threshold AND stage_b
+      // not yet set. Errored stage_a rows are excluded (their score is null).
+      candidates = jobs.filter(
+        (j) =>
+          j &&
+          j.evaluation?.stage_a?.status === 'evaluated' &&
+          (j.evaluation.stage_a.score ?? 0) >= threshold &&
+          j.evaluation.stage_b == null
+      );
+    }
+
+    if (candidates.length === 0) {
+      return res.json({
+        total: 0,
+        evaluated: 0,
+        errors: 0,
+        skipped: 0,
+        total_cost_usd: 0,
+        total_web_search_requests: 0,
+        threshold,
+      });
+    }
+
+    const result = await evaluateJobsStageB(candidates, prefs);
+
+    // Map results back to jobs by id and mutate evaluation.stage_b in place.
+    // Spread the existing evaluation object so stage_a sibling isn't clobbered.
+    const evaluatedAt = new Date().toISOString();
+    const resultsById = new Map(result.results.map((r) => [r.jobId, r]));
+    let totalWebSearchRequests = 0;
+    const jobErrors = [];
+    for (const job of candidates) {
+      const r = resultsById.get(job.id);
+      if (!r) continue;
+      const stageB = {
+        total_score: r.total_score ?? null,
+        report_path: r.report_path ?? null,
+        blocks_emitted: r.blocks_emitted ?? [],
+        model: r.model,
+        evaluated_at: evaluatedAt,
+        cost_usd: r.cost_usd ?? 0,
+        web_search_requests: r.web_search_requests ?? 0,
+        tool_rounds_used: r.tool_rounds_used ?? 0,
+        status: r.status,
+      };
+      if (r.error) {
+        stageB.error = String(r.error).slice(0, 500);
+        jobErrors.push({ jobId: job.id, error: stageB.error });
+      }
+      job.evaluation = { ...(job.evaluation ?? {}), stage_b: stageB };
+      totalWebSearchRequests += stageB.web_search_requests;
+    }
+
+    await atomicWriteFile(PIPELINE_FILE, JSON.stringify(pipeline, null, 2));
+
+    res.json({
+      total: candidates.length,
+      evaluated: result.evaluated,
+      errors: result.errors,
+      skipped: result.skipped,
+      total_cost_usd: result.total_cost_usd,
+      total_web_search_requests: totalWebSearchRequests,
+      threshold,
+      jobErrors,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  } finally {
+    releasePipelineEnrichLock();
+  }
+});
+
+// ─── Budget Gate: GET /api/career/evaluate/budget ──────────────────────
+// Returns today's cost aggregate + budget threshold + paused/warning
+// flags. Pure projection over the cost-log infrastructure shipped by
+// 01-foundation/03-llm-cost-observability (readCostRecords,
+// aggregateCosts) plus the daily_budget_usd field added to
+// PreferencesSchema by 04-budget-gate m1.
+//
+// Today-mode reads (no query params on readCostRecords): local-tz day
+// start, satisfies constraint #4 (no UTC-rollover surprise at 11pm).
+//
+// m2 will add a checkBudgetGate() helper sharing the same prefs+aggregate
+// shape; this endpoint exists so the UI banner has a stable poll target.
+const BUDGET_WARNING_RATIO = 0.8;
+
+// Pre-call gate consumed by POST /evaluate/stage-b and POST /cv/tailor.
+// Returns the same paused/total/budget shape the GET /budget endpoint
+// publishes, plus a banner_message for UI use. Stage A endpoint does NOT
+// call this — Haiku is too cheap to limit per constraint #1.
+//
+// Reads disk on every call (~50ms): readCostRecords + readPreferences.
+// Caching deferred per Room plan (accuracy > speed for cost gates).
+async function checkBudgetGate() {
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const filterStart = todayStart.toISOString();
+
+  const records = await readCostRecords({ start: filterStart });
+  const totalAgg = aggregateCosts(records);
+  const todayTotal = Math.round((totalAgg.total_cost ?? 0) * 10000) / 10000;
+
+  let dailyBudget;
+  try {
+    const prefs = await readPreferences();
+    const v = prefs?.evaluator_strategy?.stage_b?.daily_budget_usd;
+    dailyBudget = typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 10;
+  } catch {
+    dailyBudget = 10;
+  }
+
+  const paused = todayTotal >= dailyBudget;
+  const banner_message = paused
+    ? `今日 Sonnet+Tailor 预算 $${dailyBudget.toFixed(2)} 用尽 (已用 $${todayTotal.toFixed(4)}) — 明天继续，或去 Settings 提高上限`
+    : '';
+
+  return { paused, today_total_usd: todayTotal, daily_budget_usd: dailyBudget, banner_message };
+}
+
+app.get('/api/career/evaluate/budget', async (_req, res) => {
+  try {
+    const now = new Date();
+    // Local-tz today 00:00 — same construction as GET /api/career/llm-costs
+    // default mode (line 1232ish). Keep in sync if that changes.
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const filterStart = todayStart.toISOString();
+
+    const records = await readCostRecords({ start: filterStart });
+    const totalAgg = aggregateCosts(records);
+    const byCallerAgg = aggregateCosts(records, 'caller');
+
+    let dailyBudget;
+    try {
+      const prefs = await readPreferences();
+      const v = prefs?.evaluator_strategy?.stage_b?.daily_budget_usd;
+      // Schema default kicks in when prefs.yml has the file but no field;
+      // when prefs.yml is missing entirely, readPreferences returns the
+      // defaultPreferences() shape which already includes daily_budget_usd:10.
+      // Defensive fallback handles the corrupt-prefs path.
+      dailyBudget = typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 10;
+    } catch {
+      // Prefs unparseable — fall back to default; banner will still show
+      // current cost, just against the default threshold. m2's gate will
+      // do the same thing.
+      dailyBudget = 10;
+    }
+
+    const todayTotal = totalAgg.total_cost ?? 0;
+    const paused = todayTotal >= dailyBudget;
+    const warning = !paused && todayTotal >= BUDGET_WARNING_RATIO * dailyBudget;
+
+    res.json({
+      today_total_usd: Math.round(todayTotal * 10000) / 10000,
+      daily_budget_usd: dailyBudget,
+      paused,
+      warning,
+      by_caller: byCallerAgg,
+      day_start: filterStart,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── CV Tailor: POST /api/career/cv/tailor + GET /output ────────────────
+// Tailor takes a Job (with Block E from its Stage B report), a chosen
+// resume (or Auto-Select fallback), and produces a tailored markdown
+// resume in data/career/output/{jobId}-{resumeId}.md.
+//
+// Single-job, user-driven. NO pipelineMutex — Tailor reads pipeline.json
+// read-only and writes only to its own output dir (uniquely keyed). No
+// mutation of pipeline.json (Tailor does not record evaluation state).
+//
+// Path-traversal defense pattern matches Stage B m4: GET /output reads
+// content from a path BUILT FROM validated jobId+resumeId — never from
+// any stored field. Defense-in-depth startsWith check on the resolved path.
+
+const TAILOR_OUTPUT_DIR = path.resolve('data', 'career', 'output');
+
+const TailorRequestSchema = z.object({
+  jobId: z.string().regex(JOB_ID_PATH_RE),
+  resumeId: z.string().regex(RESUME_ID_RE).optional(),
+  userHint: z.string().max(2000).optional(),
+  // 04-budget-gate m2: explicit override of the daily-budget gate.
+  // Same strict-boolean contract as Stage B. Cost STILL records.
+  force: z.boolean().optional(),
+});
+
+// Resolve which resumeId to use:
+//   1. explicit body.resumeId → validate exists in resume index → 404 if not
+//   2. missing → Auto-Select via scoreResumeAgainstJd against job.description
+//      + job.role; pick top (ties broken by is_default → created_at)
+//   3. resume index empty → throw RESUME_INDEX_EMPTY for caller to 404
+//
+// Returns { resumeId, picked_reason, picked_via }.
+const RESUME_INDEX_EMPTY = Symbol('resume_index_empty');
+const RESUME_NOT_FOUND = Symbol('resume_not_found');
+
+async function resolveResumeIdForTailor(body, job) {
+  const idx = await readResumeIndex();
+  if (!idx.resumes || idx.resumes.length === 0) {
+    const e = new Error('No resumes registered');
+    e.code = RESUME_INDEX_EMPTY;
+    throw e;
+  }
+
+  if (body.resumeId) {
+    const found = idx.resumes.find((r) => r && r.id === body.resumeId);
+    if (!found) {
+      const e = new Error(`resumeId not in index: ${body.resumeId}`);
+      e.code = RESUME_NOT_FOUND;
+      throw e;
+    }
+    return {
+      resumeId: body.resumeId,
+      picked_reason: 'explicit (caller-supplied)',
+      picked_via: 'explicit',
+    };
+  }
+
+  // Auto-Select fallback — re-uses scoreResumeAgainstJd from 04-auto-select.
+  // Wrap each readResumeMetadata in try/catch — malformed YAML or transient
+  // EACCES/EISDIR from one resume's metadata.yml MUST NOT 500 the whole
+  // tailor request. Treat as score=0 (resume still rankable, just no
+  // keyword signal), so Auto-Select can still produce a winner.
+  const jdText = typeof job?.description === 'string' ? job.description : '';
+  const role = typeof job?.role === 'string' ? job.role : '';
+  const rankings = [];
+  for (const r of idx.resumes) {
+    let md;
+    try {
+      md = await readResumeMetadata(r.id);
+    } catch (err) {
+      console.warn(
+        '[tailor] readResumeMetadata failed for',
+        r.id, '— ranking with score=0:',
+        String(err?.message ?? err).slice(0, 200)
+      );
+      md = {};
+    }
+    const { score, matched } = scoreResumeAgainstJd(md, jdText, role);
+    rankings.push({
+      id: r.id,
+      score,
+      matched,
+      is_default: r.is_default,
+      created_at: r.created_at,
+    });
+  }
+  rankings.sort((a, b) => {
+    if (a.score !== b.score) return b.score - a.score;
+    if (a.is_default !== b.is_default) return a.is_default ? -1 : 1;
+    return a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0;
+  });
+  const top = rankings[0];
+  return {
+    resumeId: top.id,
+    picked_reason: buildPickReason(top),
+    picked_via: 'auto-select',
+  };
+}
+
+// Cap on base.md size returned in the response. Defends against an
+// attacker (or accidentally) huge base.md OOM'ing the JSON response or
+// hanging the diff render. 256KB ~= ~50K markdown lines, well above any
+// reasonable resume size.
+const TAILOR_BASE_MD_MAX_BYTES = 256 * 1024;
+
+async function readResumeBaseMd(resumeId) {
+  const baseFile = path.join(resolveResumeDir(resumeId), 'base.md');
+  if (!existsSync(baseFile)) return '';
+  try {
+    // Stat first to short-circuit oversized reads without loading them.
+    const stat = await fs.stat(baseFile);
+    if (stat.size > TAILOR_BASE_MD_MAX_BYTES) {
+      console.warn(
+        '[tailor] base.md exceeds size cap',
+        TAILOR_BASE_MD_MAX_BYTES,
+        'for',
+        resumeId,
+        '— truncating'
+      );
+      const fh = await fs.open(baseFile, 'r');
+      try {
+        const buf = Buffer.alloc(TAILOR_BASE_MD_MAX_BYTES);
+        await fh.read(buf, 0, TAILOR_BASE_MD_MAX_BYTES, 0);
+        return buf.toString('utf-8') + '\n\n[...truncated; resume base.md exceeds size cap]';
+      } finally {
+        await fh.close();
+      }
+    }
+    const raw = await fs.readFile(baseFile, 'utf-8');
+    return typeof raw === 'string' ? raw : '';
+  } catch (err) {
+    console.warn(
+      '[tailor] readResumeBaseMd failed for',
+      resumeId, ':',
+      String(err?.message ?? err).slice(0, 200)
+    );
+    return '';
+  }
+}
+
+app.post('/api/career/cv/tailor', async (req, res) => {
+  let body;
+  try {
+    body = TailorRequestSchema.parse(req.body ?? {});
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid body', details: e.issues });
+  }
+
+  // 04-budget-gate m2: pre-call gate. AFTER body parse (so 400 zod
+  // errors take precedence) and BEFORE pipeline.json read. body.force
+  // === true bypasses; cost still records via tailorOneJob runner.
+  if (body.force !== true) {
+    const gate = await checkBudgetGate();
+    if (gate.paused) {
+      return res.status(402).json({
+        error: 'daily_budget_usd reached for Tailor',
+        banner_message: gate.banner_message,
+        today_total_usd: gate.today_total_usd,
+        daily_budget_usd: gate.daily_budget_usd,
+      });
+    }
+  }
+
+  if (!existsSync(PIPELINE_FILE)) {
+    return res.status(404).json({ error: 'pipeline.json does not exist' });
+  }
+  let pipeline;
+  try {
+    pipeline = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+  } catch {
+    return res.status(500).json({ error: 'pipeline.json unparseable' });
+  }
+  const jobs = Array.isArray(pipeline?.jobs) ? pipeline.jobs : [];
+  const job = jobs.find((j) => j && j.id === body.jobId);
+  if (!job) return res.status(404).json({ error: `jobId not found: ${body.jobId}` });
+
+  // 412 — Tailor requires a successfully-evaluated Stage B report (Block E
+  // is the primary input). Error-status stage_b doesn't have a usable report.
+  const stageB = job.evaluation?.stage_b;
+  if (!stageB || stageB.status !== 'evaluated') {
+    return res.status(412).json({
+      error: 'job has no successfully-evaluated Stage B report (Block E required for tailor)',
+      stage_b_status: stageB?.status ?? null,
+    });
+  }
+
+  // Resolve resumeId (explicit or Auto-Select)
+  let picked;
+  try {
+    picked = await resolveResumeIdForTailor(body, job);
+  } catch (e) {
+    if (e?.code === RESUME_INDEX_EMPTY) {
+      return res.status(404).json({ error: 'No resumes registered — add a resume first' });
+    }
+    if (e?.code === RESUME_NOT_FOUND) {
+      return res.status(404).json({ error: e.message });
+    }
+    return res.status(500).json({ error: e.message });
+  }
+
+  // Pre-load base.md so the response can return it for diff display
+  // without forcing the UI to make a second fetch.
+  const baseMarkdown = await readResumeBaseMd(picked.resumeId);
+
+  // Run the tailor — single-job, NEVER throws (errors land in result.status)
+  const result = await tailorOneJob(job, picked.resumeId, body.userHint, {});
+
+  if (result.status === TAILOR_STATUS.ERROR) {
+    return res.status(502).json({
+      error: result.error ?? 'tailor failed',
+      jobId: result.jobId,
+      resumeId: result.resumeId,
+      cost_usd: result.cost_usd ?? 0,
+      picked_resume_id: picked.resumeId,
+      picked_reason: picked.picked_reason,
+      picked_via: picked.picked_via,
+    });
+  }
+
+  res.json({
+    tailored_markdown: result.tailored_markdown,
+    base_markdown: baseMarkdown,
+    output_path: result.output_path,
+    cost_usd: result.cost_usd,
+    model: result.model,
+    picked_resume_id: picked.resumeId,
+    picked_reason: picked.picked_reason,
+    picked_via: picked.picked_via,
+    status: result.status,
+  });
+});
+
+// GET tailor output — reads disk content for the diff UI on demand.
+// Validates ids, builds path from validated ids only (NOT from any stored
+// field), defense-in-depth startsWith check (Stage B m4 critical-fix
+// pattern).
+app.get('/api/career/cv/tailor/output/:jobId/:resumeId', async (req, res) => {
+  const jobId = req.params?.jobId;
+  const resumeId = req.params?.resumeId;
+  if (typeof jobId !== 'string' || !JOB_ID_PATH_RE.test(jobId)) {
+    return res.status(400).json({ error: 'invalid jobId' });
+  }
+  if (typeof resumeId !== 'string' || !RESUME_ID_RE.test(resumeId)) {
+    return res.status(400).json({ error: 'invalid resumeId' });
+  }
+  try {
+    const outputFile = path.join(TAILOR_OUTPUT_DIR, `${jobId}-${resumeId}.md`);
+    if (!outputFile.startsWith(TAILOR_OUTPUT_DIR + path.sep)) {
+      return res.status(400).json({ error: 'invalid output path' });
+    }
+    if (!existsSync(outputFile)) {
+      return res.status(404).json({ error: 'tailor output missing on disk' });
+    }
+    const content = await fs.readFile(outputFile, 'utf-8');
+    res.json({ content, jobId, resumeId });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Pipeline: manual paste ────────────────────────────────────────────
+const ManualPasteSchema = z.object({
+  url: z.string().url().max(2000),
+  title: z.string().max(500).optional(),
+  note: z.string().max(2000).optional(),
+});
+
+app.post('/api/career/pipeline/manual', async (req, res) => {
+  // Manual paste is a pipeline.json writer. If a scan or enrich is running,
+  // its multi-second-to-multi-minute window could overwrite the manual write,
+  // silently dropping the just-pasted job. 409 keeps semantics consistent
+  // with /scan and /enrich.
+  const status = getScanStatus();
+  if (status.running || status.enriching) {
+    return res.status(409).json({
+      error: status.running
+        ? 'scan in progress; manual paste would race the scan write'
+        : 'enrich in progress; manual paste would race the enrich write',
+    });
+  }
+  try {
+    const body = ManualPasteSchema.parse(req.body);
+    const job = await manualPaste(body);
+
+    // Append to pipeline.json. The 409 above ensures no scan/enrich is mid-
+    // flight, so this read-modify-write is safe under our single-process model.
+    let current = { jobs: [], last_scan_at: null, scan_summary: [] };
+    if (existsSync(PIPELINE_FILE)) {
+      try {
+        current = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+      } catch {
+        current = { jobs: [], last_scan_at: null, scan_summary: [] };
+      }
+    }
+    if (!Array.isArray(current.jobs)) current.jobs = [];
+    // Replace existing manual entry for same id (idempotent re-paste).
+    current.jobs = current.jobs.filter((j) => j.id !== job.id);
+    current.jobs.push(job);
+    await atomicWriteFile(PIPELINE_FILE, JSON.stringify(current, null, 2));
+
+    res.status(201).json({ job });
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid manual paste', details: e.issues });
+    }
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Application State (08-human-gate-tracker/01) ──────────────────────
+// 4 endpoints over data/career/applications.json. Reads are unmutexed
+// (parse-once snapshots are safe under POSIX-atomic-rename writes); writes
+// acquire applicationsMutex (independent of pipelineMutex) for in-process
+// HTTP-concurrent serialization. Illegal transitions return structured 400
+// with current_status + allowed_next so the UI can render actionable
+// feedback. id regex is canonical {12-hex jobId}-{YYYYMMDD}.
+
+// Body schemas
+const StatusUpdateSchema = z
+  .object({
+    status: z.enum(STATUS_VALUES),
+    note: z.string().max(1000).optional(),
+  })
+  .strict();
+
+// User-appendable timeline events: subset of TIMELINE_EVENT_TYPES that
+// excludes the reserved internal events ('status_changed' + 'created').
+// The store also enforces this — endpoint just rejects earlier with a
+// cleaner Zod error.
+const USER_TIMELINE_EVENTS = TIMELINE_EVENT_TYPES.filter(
+  (e) => e !== 'status_changed' && e !== 'created'
+);
+const TimelineAppendSchema = z
+  .object({
+    event: z.enum(USER_TIMELINE_EVENTS),
+    note: z.string().max(1000).optional(),
+    ts: z.string().datetime({ offset: true }).optional(),
+  })
+  .strict();
+
+// GET /api/career/applications — list, optional ?status=CSV filter
+app.get('/api/career/applications', async (req, res) => {
+  try {
+    const arr = await readApplications();
+    const filterParam = typeof req.query.status === 'string' ? req.query.status : null;
+    // Defensive copy so .sort() never mutates the snapshot returned by
+    // readApplications (review fix M1 — guards against future caching).
+    let result;
+    if (filterParam) {
+      const allowed = new Set(
+        filterParam.split(',').map((s) => s.trim()).filter((s) => s.length > 0)
+      );
+      if (allowed.size === 0) {
+        return res.status(400).json({ error: 'empty status filter' });
+      }
+      // Reject unknown values up-front so the client knows their query was bad
+      for (const s of allowed) {
+        if (!STATUS_VALUES.includes(s)) {
+          return res.status(400).json({ error: `unknown status filter: ${s}` });
+        }
+      }
+      result = arr.filter((row) => allowed.has(row.status));
+    } else {
+      result = [...arr];
+    }
+    // Sort by max(timeline.ts) desc — most-recently-touched first
+    result.sort((a, b) => {
+      const ta = a.timeline[a.timeline.length - 1]?.ts ?? '';
+      const tb = b.timeline[b.timeline.length - 1]?.ts ?? '';
+      if (tb < ta) return -1;
+      if (tb > ta) return 1;
+      return 0;
+    });
+    res.json({ total: arr.length, filtered: result.length, results: result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/career/applications/:id — single
+app.get('/api/career/applications/:id', async (req, res) => {
+  const id = req.params?.id;
+  if (typeof id !== 'string' || !APPLICATION_ID_RE.test(id)) {
+    return res.status(400).json({ error: 'invalid id (must match {jobId}-YYYYMMDD)' });
+  }
+  try {
+    const arr = await readApplications();
+    const row = arr.find((r) => r.id === id);
+    if (!row) return res.status(404).json({ error: 'application not found' });
+    res.json(row);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/career/applications/:id/status — transition status
+app.post('/api/career/applications/:id/status', async (req, res) => {
+  const id = req.params?.id;
+  if (typeof id !== 'string' || !APPLICATION_ID_RE.test(id)) {
+    return res.status(400).json({ error: 'invalid id (must match {jobId}-YYYYMMDD)' });
+  }
+  let body;
+  try {
+    body = StatusUpdateSchema.parse(req.body ?? {});
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid body', details: e.issues });
+  }
+  // Acquire mutex BEFORE first await so the in-process race window is closed.
+  const lock = acquireApplicationsLock();
+  if (!lock.ok) {
+    return res.status(409).json({
+      error: 'applications.json busy; retry shortly',
+      acquired_at: lock.acquired_at,
+    });
+  }
+  try {
+    const updated = await transitionStatus(id, body.status, body.note);
+    res.json(updated);
+  } catch (e) {
+    if (e instanceof InvalidTransitionError) {
+      return res.status(400).json({
+        error: e.message,
+        current_status: e.current_status,
+        allowed_next: e.allowed_next,
+      });
+    }
+    if (e instanceof ApplicationNotFoundError) {
+      return res.status(404).json({ error: e.message });
+    }
+    res.status(500).json({ error: e.message });
+  } finally {
+    releaseApplicationsLock();
+  }
+});
+
+// POST /api/career/applications/:id/timeline — append free-form event
+app.post('/api/career/applications/:id/timeline', async (req, res) => {
+  const id = req.params?.id;
+  if (typeof id !== 'string' || !APPLICATION_ID_RE.test(id)) {
+    return res.status(400).json({ error: 'invalid id (must match {jobId}-YYYYMMDD)' });
+  }
+  let body;
+  try {
+    body = TimelineAppendSchema.parse(req.body ?? {});
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid body', details: e.issues });
+  }
+  const event = {
+    ts: body.ts ?? new Date().toISOString(),
+    event: body.event,
+    ...(body.note ? { note: body.note } : {}),
+  };
+  const lock = acquireApplicationsLock();
+  if (!lock.ok) {
+    return res.status(409).json({
+      error: 'applications.json busy; retry shortly',
+      acquired_at: lock.acquired_at,
+    });
+  }
+  try {
+    const updated = await appendTimelineEvent(id, event);
+    res.json(updated);
+  } catch (e) {
+    if (e instanceof TimelineOrderError) {
+      return res.status(400).json({ error: e.message });
+    }
+    if (e instanceof ApplicationNotFoundError) {
+      return res.status(404).json({ error: e.message });
+    }
+    res.status(500).json({ error: e.message });
+  } finally {
+    releaseApplicationsLock();
+  }
+});
+
+// ─── Mode 1 Applier draft endpoints (07-applier/01-mode1-simplify-hybrid m3)
+// POST /apply/draft generates the field draft via single Sonnet call.
+// GET /apply/draft/:jobId returns a previously-persisted draft.
+//
+// Reads pipeline.json + reports/{jobId}.md + qa-bank inputs + Tailor PDF
+// path → calls draftRunner.generateDraft → persists via draftsStore.writeDraft.
+// Budget gate (402 with force=true override) parallels Stage B + Tailor.
+
+const ApplyDraftBodySchema = z
+  .object({
+    jobId: z.string().regex(DRAFT_JOB_ID_RE, 'jobId must match 12-hex'),
+    force: z.boolean().optional(),
+  })
+  .strict();
+
+app.post('/api/career/apply/draft', async (req, res) => {
+  // Outer try/catch matches Stage B / Tailor convention — without it,
+  // an EACCES / EMFILE / unexpected throw inside loadApplierBundle would
+  // bubble to Express's default HTML error page, breaking the JSON-only
+  // contract AND leaking absolute filesystem paths in the stack trace.
+  // (review fix H1)
+  try {
+    let body;
+    try {
+      body = ApplyDraftBodySchema.parse(req.body ?? {});
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid body', details: e.issues });
+    }
+
+    // Budget gate FIRST (no I/O waste when paused). force=true bypasses;
+    // cost still records via runner.
+    if (body.force !== true) {
+      const gate = await checkBudgetGate();
+      if (gate.paused) {
+        return res.status(402).json({
+          error: 'daily_budget_usd reached for Mode 1 draft',
+          banner_message: gate.banner_message,
+          today_total_usd: gate.today_total_usd,
+          daily_budget_usd: gate.daily_budget_usd,
+        });
+      }
+    }
+
+    // Find the job in pipeline.json
+    if (!existsSync(PIPELINE_FILE)) {
+      return res.status(404).json({ error: 'pipeline.json does not exist' });
+    }
+    let pipeline;
+    try {
+      pipeline = JSON.parse(await fs.readFile(PIPELINE_FILE, 'utf-8'));
+    } catch {
+      return res.status(500).json({ error: 'pipeline.json unparseable' });
+    }
+    const jobs = Array.isArray(pipeline?.jobs) ? pipeline.jobs : [];
+    const job = jobs.find((j) => j && j.id === body.jobId);
+    if (!job) {
+      return res.status(404).json({ error: `job not found in pipeline.json: ${body.jobId}` });
+    }
+
+    // Load the draft input bundle. reportExists==false means Stage B
+    // hasn't run yet — Mode 1 draft without Block E personalization seed
+    // produces generic garbage, so we 404 with an actionable hint.
+    const bundle = await loadApplierBundle(body.jobId);
+    if (!bundle.reportExists) {
+      return res.status(404).json({
+        error: 'Stage B report not generated for this job',
+        hint: 'Run Stage B from /career/pipeline first; the draft uses Block E as the personalization seed.',
+      });
+    }
+
+    // Generate the draft (NEVER throws — error surfaces as result.status='error')
+    const result = await generateDraft(job, bundle);
+    if (result.status === DRAFT_STATUS.ERROR) {
+      return res.status(502).json({
+        error: 'Draft generation failed',
+        detail: result.error,
+        cost_usd: result.cost_usd,
+      });
+    }
+
+    // Persist via draftsStore (writeDraft validates via Zod again — defense
+    // in depth in case the runner's parser produces a near-valid shape that
+    // slips through).
+    const draftRecord = {
+      jobId: body.jobId,
+      fields: result.fields,
+      generated_at: result.generated_at,
+      model: result.model,
+      cost_usd: result.cost_usd,
+    };
+    try {
+      await writeDraft(body.jobId, draftRecord);
+    } catch (e) {
+      return res.status(500).json({
+        error: 'Draft persisted-shape validation failed',
+        detail: String(e?.message ?? e).slice(0, 300),
+      });
+    }
+
+    res.status(200).json(draftRecord);
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message ?? e).slice(0, 300) });
+  }
+});
+
+// POST /api/career/apply/submitted — Mark Submitted backend.
+//
+// 07-applier/01-mode1-simplify-hybrid m4. Atomically transitions the
+// applications.json row to Applied AND appends each submitted field to
+// qa-bank/history.jsonl (the Applier feedback flywheel ② data source).
+//
+// Body: { jobId: 12-hex, fields: [{label, final_answer, class}], note? }
+//
+// ID resolution per spec consumer-contract: tries `${jobId}-${today-local-tz}`
+// first (matches Stage B m3 hook's per-day insert), falls back to any
+// applications row with this jobId prefix when same-day not found (handles
+// cross-day re-eval).
+//
+// Status transitions are validated by store.transitionStatus — illegal
+// transitions (e.g. Applied → Applied) return 400 with structured
+// {error, current_status, allowed_next}.
+//
+// All 4 classes append to history.jsonl per locked design — feedback
+// flywheel benefits from the full picture (not just open-ended).
+
+const SubmittedFieldSchema = z
+  .object({
+    label: z.string().min(1).max(200),
+    final_answer: z.string().max(2000), // 2KB cap for POSIX-atomic appendFile
+    class: z.enum(['hard', 'legal', 'open', 'file']),
+  })
+  .strict();
+
+const ApplySubmittedBodySchema = z
+  .object({
+    jobId: z.string().regex(DRAFT_JOB_ID_RE, 'jobId must match 12-hex'),
+    fields: z.array(SubmittedFieldSchema).min(1).max(50),
+    note: z.string().max(1000).optional(),
+  })
+  .strict();
+
+function todayYyyymmddLocal() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}${m}${day}`;
+}
+
+app.post('/api/career/apply/submitted', async (req, res) => {
+  // Outer try/catch matches Stage B / Tailor / m3 convention so any
+  // unexpected throw returns JSON 500 (not Express HTML).
+  try {
+    let body;
+    try {
+      body = ApplySubmittedBodySchema.parse(req.body ?? {});
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid body', details: e.issues });
+    }
+
+    // Resolve the applications.json row id. Tries `${jobId}-${today}` first
+    // (matches Stage B m3 auto-insert convention), then the MOST-RECENT row
+    // with the jobId prefix (handles cross-day re-eval — consumer contract).
+    // Pick newest via id-desc sort: ids are `{12-hex}-{YYYYMMDD}` so lexical
+    // sort on the suffix is also chronological.
+    const todaySuffix = todayYyyymmddLocal();
+    const todayId = `${body.jobId}-${todaySuffix}`;
+    const applications = await readApplications();
+    let row = applications.find((r) => r.id === todayId);
+    if (!row) {
+      const matches = applications.filter((r) => r.id.startsWith(`${body.jobId}-`));
+      matches.sort((a, b) => (b.id < a.id ? -1 : b.id > a.id ? 1 : 0));
+      row = matches[0];
+    }
+    if (!row) {
+      return res.status(404).json({
+        error: `no applications.json row for jobId ${body.jobId}`,
+        hint: 'Run Stage B from /career/pipeline first — Stage B auto-inserts the application row.',
+      });
+    }
+
+    // Acquire applicationsMutex BEFORE first await on store helpers so the
+    // in-process race window is closed.
+    const lock = acquireApplicationsLock();
+    if (!lock.ok) {
+      return res.status(409).json({
+        error: 'applications.json busy; retry shortly',
+        acquired_at: lock.acquired_at,
+      });
+    }
+
+    let updated;
+    try {
+      try {
+        updated = await transitionStatus(
+          row.id,
+          'Applied',
+          body.note ?? 'Marked submitted via Mode 1'
+        );
+      } catch (e) {
+        if (e instanceof InvalidTransitionError) {
+          return res.status(400).json({
+            error: e.message,
+            current_status: e.current_status,
+            allowed_next: e.allowed_next,
+          });
+        }
+        if (e instanceof ApplicationNotFoundError) {
+          return res.status(404).json({ error: e.message });
+        }
+        throw e;
+      }
+    } finally {
+      releaseApplicationsLock();
+    }
+
+    // Append each submitted field to qa-bank/history.jsonl. Append-only
+    // file; fs.appendFile is POSIX-atomic for sub-PIPE_BUF (4096) writes.
+    // Each line is bounded to ~2KB by the SubmittedFieldSchema.max(2000)
+    // cap on final_answer (plus ~200 chars overhead) — well under the
+    // PIPE_BUF threshold. The HISTORY_LINE_BYTE_LIMIT runtime guard below
+    // makes the atomicity invariant load-bearing in code, not just in
+    // the comment — if a future schema bump pushes a line over PIPE_BUF
+    // we'd lose interleave-safety with a concurrent appendFile.
+    const HISTORY_LINE_BYTE_LIMIT = 4000; // PIPE_BUF=4096 minus safety
+    const now = new Date().toISOString();
+    let historyLinesAdded = 0;
+    for (const f of body.fields) {
+      const entry = {
+        ts: now,
+        jobId: body.jobId,
+        label: f.label,
+        final_answer: f.final_answer,
+        class: f.class,
+      };
+      const line = JSON.stringify(entry) + '\n';
+      if (Buffer.byteLength(line, 'utf8') > HISTORY_LINE_BYTE_LIMIT) {
+        console.warn(
+          '[apply/submitted] history.jsonl line exceeds PIPE_BUF safety limit; skipping field:',
+          f.label
+        );
+        continue;
+      }
+      try {
+        await fs.appendFile(QA_HISTORY_FILE, line, 'utf-8');
+        historyLinesAdded++;
+      } catch (e) {
+        // history.jsonl write failure MUST NOT undo the Applied transition
+        // (it's already persisted). Log + report partial success.
+        console.warn(
+          '[apply/submitted] history.jsonl append failed:',
+          String(e?.message ?? e).slice(0, 200)
+        );
+        break;
+      }
+    }
+
+    res.status(200).json({
+      application: updated,
+      history_lines_added: historyLinesAdded,
+      total_fields: body.fields.length,
+      partial: historyLinesAdded < body.fields.length,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message ?? e).slice(0, 300) });
+  }
+});
+
+app.get('/api/career/apply/draft/:jobId', async (req, res) => {
+  const jobId = req.params?.jobId;
+  if (typeof jobId !== 'string' || !DRAFT_JOB_ID_RE.test(jobId)) {
+    return res.status(400).json({ error: 'invalid jobId (must match 12-hex)' });
+  }
+  let draft;
+  try {
+    draft = await readDraft(jobId);
+  } catch (e) {
+    return res.status(500).json({
+      error: 'Stored draft is malformed',
+      detail: String(e?.message ?? e).slice(0, 300),
+    });
+  }
+  if (!draft) {
+    return res.status(404).json({ error: 'no draft persisted for this jobId' });
+  }
+  res.json(draft);
+});
+
+// ── Mode 2 Multi-Step State Machine endpoints ──────────────────────────
+//
+// 07-applier/04-multi-step-state-machine m4.
+//
+// Routes wrap the in-process orchestrator (endpoint.mjs) which manages
+// the per-jobId pending-approval Promise. Browser lifecycle is owned by
+// 02-playwright-runtime (getPage); m4 endpoint just dispatches.
+
+// L1 fix from review: reuse JOB_ID_RE constant exported by m1 store
+// rather than redefining locally (drift risk if format changes).
+const MULTI_STEP_JOB_ID_RE = APPLY_SESSIONS_JOB_ID_RE;
+
+app.post('/api/career/applier/multi-step/start', async (req, res) => {
+  try {
+    let body;
+    try {
+      body = MultiStepStartBodySchema.parse(req.body ?? {});
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid body', details: e.issues });
+    }
+    // Auto-approve mode: caller may override per-apply via body.autoApproveWhenSafe;
+    // otherwise read the preferences.yml setting (default off). Strict safety
+    // gate is enforced inside endpoint.mjs — this layer only forwards the flag.
+    if (typeof body.autoApproveWhenSafe !== 'boolean') {
+      try {
+        const prefs = await readPreferences();
+        body = { ...body, autoApproveWhenSafe: !!prefs?.applier?.auto_approve_when_safe };
+      } catch {
+        body = { ...body, autoApproveWhenSafe: false };
+      }
+    }
+    // freshStart: /start always begins a clean apply — clears any prior
+    // (completed/errored) session. /resume is the path that keeps state.
+    const result = await multiStepStart(body, { freshStart: true });
+    if (result.error) {
+      return res.status(result.status || 500).json({ error: result.error });
+    }
+    res.status(202).json({ sessionId: result.sessionId, started_at: result.started_at });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+app.get('/api/career/applier/multi-step/:jobId/status', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!MULTI_STEP_JOB_ID_RE.test(jobId)) {
+      return res.status(400).json({ error: 'jobId must match 12-hex' });
+    }
+    const result = await multiStepGetStatus(jobId);
+    if (result.error) {
+      return res.status(result.status || 500).json({ error: result.error });
+    }
+    // m14 [integration-finding #4]: same C2-pattern bug as m13 — earlier
+    // the route picked {sessionId, session, machine} only, STRIPPING the
+    // top-level submitDetectedBy field. Forward the whole result minus
+    // the internal `status` field. [review M3] Consistent with the
+    // `_handleFieldAction` C2 pattern. `error` is already returned via
+    // the early-return branch above so it won't appear in the spread.
+    const { status: _s, ...payload } = result;
+    res.json(payload);
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+app.post('/api/career/applier/multi-step/:jobId/approve-step', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!MULTI_STEP_JOB_ID_RE.test(jobId)) {
+      return res.status(400).json({ error: 'jobId must match 12-hex' });
+    }
+    let body;
+    try {
+      body = MultiStepApproveBodySchema.parse(req.body ?? {});
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid body', details: e.issues });
+    }
+    const result = multiStepApproveStep(jobId, body);
+    if (result.error) {
+      return res.status(result.status || 500).json({ error: result.error });
+    }
+    res.status(202).json({ sessionId: result.sessionId });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+app.post('/api/career/applier/multi-step/:jobId/pause', (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!MULTI_STEP_JOB_ID_RE.test(jobId)) {
+      return res.status(400).json({ error: 'jobId must match 12-hex' });
+    }
+    const result = multiStepPause(jobId);
+    if (result.error) {
+      return res.status(result.status || 500).json({ error: result.error });
+    }
+    res.status(202).json({ sessionId: result.sessionId });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+// m7: user-driven escalation. Distinct from /pause — /cancel marks
+// the session ESCALATED (no further auto-submit, control to user).
+// Operator finishes in browser, then POSTs to mark applied.
+//
+// CSRF protection [review H2]: /cancel is state-changing and persists
+// session.status='paused' with an in-memory ESCALATED flag. Without
+// origin check, a cross-origin page could mass-cancel any in-flight
+// apply if it could guess the 12-hex jobId. Same-origin guard reuses
+// the isSameOriginWrite helper from /api/config (allowlist incl
+// vite dev origin). Curl / smoke (no Origin header) fall through.
+// NOTE: other applier routes (/pause, /approve-step, /resume) carry
+// the same risk and should be guarded in a follow-up; m7 ships /cancel
+// with the guard so the new attack surface is covered.
+app.post('/api/career/applier/multi-step/:jobId/cancel', async (req, res) => {
+  try {
+    if (!isSameOriginWrite(req)) {
+      return res.status(403).json({
+        error: 'cross-origin cancel rejected (same-origin policy)',
+      });
+    }
+    const { jobId } = req.params;
+    if (!MULTI_STEP_JOB_ID_RE.test(jobId)) {
+      return res.status(400).json({ error: 'jobId must match 12-hex' });
+    }
+    const result = await multiStepCancel(jobId);
+    if (result.error) {
+      return res.status(result.status || 500).json({ error: result.error });
+    }
+    res.status(result.status || 202).json({
+      sessionId: result.sessionId,
+      escalation_reason: result.escalation_reason,
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+app.post('/api/career/applier/multi-step/:jobId/resume', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!MULTI_STEP_JOB_ID_RE.test(jobId)) {
+      return res.status(400).json({ error: 'jobId must match 12-hex' });
+    }
+    // L2 fix from review: explicit mismatch check so silent URL-wins
+    // doesn't mask a client bug. URL remains canonical.
+    if (req.body && typeof req.body === 'object' && req.body.jobId && req.body.jobId !== jobId) {
+      return res.status(400).json({
+        error: `jobId mismatch: URL=${jobId} body=${req.body.jobId}`,
+      });
+    }
+    let body;
+    try {
+      body = MultiStepResumeBodySchema.parse({ ...(req.body || {}), jobId });
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid body', details: e.issues });
+    }
+    const result = await multiStepResume(body);
+    if (result.error) {
+      return res.status(result.status || 500).json({ error: result.error });
+    }
+    res.status(202).json({ sessionId: result.sessionId, started_at: result.started_at });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+// Bring the applier's headful Chromium window (the one with the filled
+// form) to the foreground — it routinely ends up hidden behind other
+// windows. Acts only on an already-open browser; never launches one.
+app.post('/api/career/applier/multi-step/:jobId/reveal', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!MULTI_STEP_JOB_ID_RE.test(jobId)) {
+      return res.status(400).json({ error: 'jobId must match 12-hex' });
+    }
+    const { bringPageToFront } = await import('./src/career/applier/runtime/browser.mjs');
+    const result = await bringPageToFront(jobId);
+    if (!result.ok) {
+      return res.status(409).json({ error: result.error || 'could not reveal the browser' });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+// ── m9: per-field UI actions + SSE event stream ────────────────────────
+//
+// All three POST routes are same-origin-guarded (CSRF protection) the
+// same way /cancel is — operator action targeting an in-flight session
+// must originate from the dashboard or vite-dev origin.
+//
+// The 3 POST handlers in endpoint.mjs validate the body, locate the
+// field by refId across the session's per-step drafts, and either
+// (skipField) mutate state or (focus/retry) acknowledge — live wiring
+// to Phase 2/m6 + Phase 2/m4 awaits the cross-Room glue milestone.
+
+function _handleFieldAction(req, res, schema, handler, methodLabel) {
+  try {
+    if (!isSameOriginWrite(req)) {
+      return res.status(403).json({
+        error: `cross-origin ${methodLabel} rejected (same-origin policy)`,
+      });
+    }
+    const { jobId } = req.params;
+    if (!MULTI_STEP_JOB_ID_RE.test(jobId)) {
+      return res.status(400).json({ error: 'jobId must match 12-hex' });
+    }
+    let body;
+    try {
+      body = schema.parse(req.body || {});
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid body', details: e.issues });
+    }
+    // Returning a Promise from inside try means the inner await happens
+    // inside the route handler closure — broadcast on success.
+    return Promise.resolve(handler(jobId, body))
+      .then((result) => {
+        if (result.error) {
+          // [review C2] Forward the FULL structured failure payload so
+          // the client can branch on `reason` / `code` / `detail`. Before
+          // this fix the route stripped to {error} only, making Apply.tsx's
+          // `j.reason === 'no_live_page'` branches dead code.
+          const { status, ...rest } = result;
+          return res.status(status || 500).json(rest);
+        }
+        // Side-effect: SSE-broadcast the action so other dashboard tabs
+        // see it land in near-real-time without waiting for the next poll.
+        // m11: include kind + ats + chosen + parsed_strategy when present
+        // so recovery events are usable by other tabs without re-fetching.
+        try {
+          // [review M4] Uniform `!= null` checks so empty-string / 0
+          // values don't get silently dropped from the broadcast.
+          // [m13 review H4] Forward retry outcome fields (success,
+          // fix_name, last_value) so other tabs see the retry result
+          // immediately and can update card state without waiting for
+          // the next poll.
+          sseBroadcast(jobId, `field_${methodLabel}`, {
+            ...(result.ref != null ? { ref: result.ref } : {}),
+            ...(result.strategy != null ? { strategy: result.strategy } : {}),
+            ...(result.requested_strategy != null ? { requested_strategy: result.requested_strategy } : {}),
+            ...(result.new_status != null ? { new_status: result.new_status } : {}),
+            ...(result.kind != null ? { kind: result.kind } : {}),
+            ...(result.ats != null ? { ats: result.ats } : {}),
+            ...(result.chosen != null ? { chosen: result.chosen } : {}),
+            ...(result.parsed_strategy != null ? { parsed_strategy: result.parsed_strategy } : {}),
+            ...(result.result != null ? { result: result.result } : {}),
+            ...(result.fix_name != null ? { fix_name: result.fix_name } : {}),
+            ...(result.success != null ? { success: result.success } : {}),
+            ...(result.last_value != null ? { last_value: result.last_value } : {}),
+          });
+        } catch { /* hub failures must never break the response */ }
+        return res.status(result.status || 202).json(result);
+      })
+      .catch((err) => {
+        res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+      });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+}
+
+app.post('/api/career/applier/multi-step/:jobId/focus-field', (req, res) => {
+  _handleFieldAction(req, res, FieldActionBodySchema, multiStepFocusField, 'focus');
+});
+
+app.post('/api/career/applier/multi-step/:jobId/retry-field', (req, res) => {
+  _handleFieldAction(req, res, RetryFieldBodySchema, multiStepRetryField, 'retry');
+});
+
+app.post('/api/career/applier/multi-step/:jobId/skip-field', (req, res) => {
+  _handleFieldAction(req, res, FieldActionBodySchema, multiStepSkipField, 'skip');
+});
+
+// m11: Phase 4 recovery routes — same shape as the m9 actions
+// (_handleFieldAction wraps origin guard + body validation + SSE
+// broadcast). The methodLabel ('resume_compress' etc.) becomes the
+// SSE event name `field_<label>`.
+app.post('/api/career/applier/multi-step/:jobId/recover/resume-compress', (req, res) => {
+  _handleFieldAction(req, res, RecoverResumeCompressBodySchema, multiStepRecoverResumeCompress, 'resume_compress');
+});
+
+app.post('/api/career/applier/multi-step/:jobId/recover/alt-formats', (req, res) => {
+  _handleFieldAction(req, res, RecoverAltFormatsBodySchema, multiStepRecoverAltFormats, 'alt_formats');
+});
+
+app.post('/api/career/applier/multi-step/:jobId/recover/identify-ats', (req, res) => {
+  _handleFieldAction(req, res, RecoverIdentifyAtsBodySchema, multiStepRecoverIdentifyAts, 'identify_ats');
+});
+
+app.post('/api/career/applier/multi-step/:jobId/recover/user-hint', (req, res) => {
+  _handleFieldAction(req, res, RecoverUserHintBodySchema, multiStepRecoverUserHint, 'user_hint');
+});
+
+// SSE event stream — used by Apply.tsx to render live observer events
+// (Phase 2/m6 attachFormObserver pushes through here once cross-Room
+// wiring lands) AND the field-action broadcasts above so other tabs
+// see actions immediately. GET — no body, no CSRF concern, though the
+// route still validates the jobId shape.
+app.get('/api/career/applier/multi-step/:jobId/events', (req, res) => {
+  try {
+    const { jobId } = req.params;
+    if (!MULTI_STEP_JOB_ID_RE.test(jobId)) {
+      return res.status(400).json({ error: 'jobId must match 12-hex' });
+    }
+    // The sseSubscribe call writes its own headers + initial hello.
+    // Returning without writing a response body keeps the connection
+    // open. Cleanup is wired via res.on('close') inside the hub.
+    // [review M4] replay:false — a fresh tab connecting AFTER previous
+    // events landed should NOT re-receive stale field_input/field_skip
+    // broadcasts; the polled session already reflects them and replaying
+    // would flip overlay state to outdated values.
+    sseSubscribe(jobId, res, { replay: false });
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+    }
+  }
+});
+
+// ── 07-applier/07-self-iteration/02-data-flywheel m3 — feedback approve/reject ──
+//
+// Routes wrap applySuggestion.mjs's approveSuggestion / rejectSuggestion +
+// suggestionStore's listSuggestions / readSuggestion + stores.mjs's
+// readJsonl for the stats endpoint. Approved classifier rules take effect
+// in-process (no restart); approved site-adapters land in
+// data/career/site-adapters/ and the m1 loader cache is busted.
+
+const FEEDBACK_STATUS_VALUES = Object.freeze(['pending', 'approved', 'rejected', 'all']);
+// REVIEW H3 (adv) fix: case-sensitive + no optional `.json` suffix.
+// Pre-fix /i let `FOO` through which then split-brained on case-
+// insensitive macOS FS vs case-sensitive Linux prod. The optional
+// `.json` group was also useless — readSuggestion adds it.
+// Max length matches ProposalEnvelopeSchema.id cap (120).
+const SUGGESTION_ID_RE = /^[a-z0-9_-]{1,120}$/;
+
+app.get('/api/career/feedback/suggestions', async (req, res) => {
+  try {
+    const status = typeof req.query.status === 'string' ? req.query.status : 'pending';
+    if (!FEEDBACK_STATUS_VALUES.includes(status)) {
+      return res.status(400).json({
+        error: `status must be one of ${FEEDBACK_STATUS_VALUES.join(' | ')}`,
+      });
+    }
+    const list = await feedbackListSuggestions({ status });
+    res.json({ suggestions: list, count: list.length });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+app.get('/api/career/feedback/suggestions/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!SUGGESTION_ID_RE.test(id)) {
+      return res.status(400).json({ error: 'invalid suggestion id format' });
+    }
+    const found = await feedbackReadSuggestion(id);
+    if (!found) return res.status(404).json({ error: `proposal not found: ${id}` });
+    res.json(found);
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+app.post('/api/career/feedback/suggestions/:id/approve', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!SUGGESTION_ID_RE.test(id)) {
+      return res.status(400).json({ error: 'invalid suggestion id format' });
+    }
+    let result;
+    try {
+      result = await feedbackApproveSuggestion(id);
+    } catch (err) {
+      const status = err.status || 500;
+      return res.status(status).json({ error: String(err?.message ?? err).slice(0, 300) });
+    }
+    res.status(200).json(result);
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+app.post('/api/career/feedback/suggestions/:id/reject', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!SUGGESTION_ID_RE.test(id)) {
+      return res.status(400).json({ error: 'invalid suggestion id format' });
+    }
+    let result;
+    try {
+      result = await feedbackRejectSuggestion(id);
+    } catch (err) {
+      const status = err.status || 500;
+      return res.status(status).json({ error: String(err?.message ?? err).slice(0, 300) });
+    }
+    res.status(200).json(result);
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+app.get('/api/career/feedback/stats', async (req, res) => {
+  try {
+    // Light counts-only stats endpoint — m4 Learning tab will expand
+    // this with 14-day accuracy series + site coverage join. m3 ships
+    // enough for HTTP-route plumbing tests.
+    const sinceParam = typeof req.query.since === 'string' ? Date.parse(req.query.since) : NaN;
+    const since = Number.isFinite(sinceParam)
+      ? sinceParam
+      : Date.now() - 30 * 24 * 60 * 60 * 1000;
+
+    async function count(filename) {
+      let n = 0;
+      try {
+        for await (const _r of feedbackReadJsonl(filename, { since })) {
+          void _r;
+          n += 1;
+        }
+      } catch {}
+      return n;
+    }
+    const [misclassified, edits, failures, suggestions] = await Promise.all([
+      count(FEEDBACK_FILES.FIELD_MISCLASSIFIED),
+      count(FEEDBACK_FILES.FIELD_EDITS),
+      count(FEEDBACK_FILES.SITE_FAILURES),
+      feedbackListSuggestions({ status: 'all' }),
+    ]);
+    // m4: 14-day classifier-error trend (issue rate per day). We
+    // don't track total classifications so this is a "issues per day"
+    // proxy — lower = better. Surface as `error_series` for the
+    // Learning tab Nivo line chart.
+    //
+    // REVIEW C1 adv / #2 Plan: bucket by LOCAL day, not UTC. Pre-fix
+    // setUTCHours(0,0,0,0) caused records near midnight to land in the
+    // wrong bucket relative to the user's wall clock (UTC-7 user
+    // recording at 22:30 local would see it in "tomorrow's" UTC bucket).
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const trendDays = 14;
+    const trendStart = new Date();
+    trendStart.setHours(0, 0, 0, 0);
+    trendStart.setDate(trendStart.getDate() - (trendDays - 1));
+    const HEAVY_EDIT_THRESHOLD = 50;
+    function localDayKey(d) {
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${y}-${m}-${day}`;
+    }
+    const trendBuckets = new Array(trendDays).fill(0).map((_, i) => ({
+      date: localDayKey(new Date(trendStart.getTime() + i * DAY_MS)),
+      issues: 0,
+    }));
+    const dayIdx = (ts) => {
+      const t = Date.parse(ts);
+      if (!Number.isFinite(t)) return -1;
+      const d = new Date(t);
+      d.setHours(0, 0, 0, 0);
+      return Math.round((d.getTime() - trendStart.getTime()) / DAY_MS);
+    };
+    try {
+      for await (const r of feedbackReadJsonl(FEEDBACK_FILES.FIELD_MISCLASSIFIED, {
+        since: trendStart.getTime(),
+      })) {
+        const i = dayIdx(r.ts);
+        if (i >= 0 && i < trendDays) trendBuckets[i].issues += 1;
+      }
+      for await (const r of feedbackReadJsonl(FEEDBACK_FILES.FIELD_EDITS, {
+        since: trendStart.getTime(),
+      })) {
+        const i = dayIdx(r.ts);
+        // Count only "heavy" edits per HEAVY_EDIT_THRESHOLD — small edits
+        // are typing fixes, not classifier issues. REVIEW M1 adv:
+        // finite-check edit_distance so older records with undefined
+        // field don't get truthy-compared.
+        if (
+          i >= 0 &&
+          i < trendDays &&
+          Number.isFinite(r.edit_distance) &&
+          r.edit_distance > HEAVY_EDIT_THRESHOLD
+        ) {
+          trendBuckets[i].issues += 1;
+        }
+      }
+    } catch {
+      // Best-effort — fall through with whatever we have.
+    }
+
+    res.json({
+      since: new Date(since).toISOString(),
+      flywheels: {
+        field_misclassified: misclassified,
+        field_edits: edits,
+        site_failures: failures,
+      },
+      suggestions: {
+        total: suggestions.length,
+        pending: suggestions.filter((s) => s.status === 'pending').length,
+        approved: suggestions.filter((s) => s.status === 'approved').length,
+        rejected: suggestions.filter((s) => s.status === 'rejected').length,
+      },
+      error_series: trendBuckets,
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+// 02-data-flywheel m4 — site coverage join. Counts failures from
+// site-failures.jsonl per-domain; learner can spot domains that need
+// a new adapter YAML. has_adapter from the m1 loader's registry.
+app.get('/api/career/feedback/site-coverage', async (_req, res) => {
+  try {
+    const failByDomain = new Map();
+    try {
+      for await (const r of feedbackReadJsonl(FEEDBACK_FILES.SITE_FAILURES, {
+        since: Date.now() - 30 * 24 * 60 * 60 * 1000,
+      })) {
+        if (!r.domain) continue;
+        // REVIEW H3 adv / M4 adv: lowercase key so `Acme.com` and
+        // `acme.com` aggregate. URL.hostname is already lowercased by
+        // the WHATWG URL parser, but defensive against raw-string
+        // fallback in the m1 capture hook (when URL parse fails).
+        const key = String(r.domain).toLowerCase();
+        const cur = failByDomain.get(key) || { failures: 0, adapters: new Set() };
+        cur.failures += 1;
+        if (r.site_adapter_id) cur.adapters.add(r.site_adapter_id);
+        failByDomain.set(key, cur);
+      }
+    } catch {}
+
+    // Cross-reference against the loaded site-adapter registry to mark
+    // which domains already have a bundled / approved adapter. Lazy-
+    // import to avoid pulling 06 into every server route's hot path.
+    let registry = null;
+    try {
+      const { loadAdapters } = await import('./src/career/applier/siteAdapters/loader.mjs');
+      registry = await loadAdapters();
+    } catch {}
+
+    function hasAdapter(domain) {
+      if (!registry) return false;
+      for (const a of registry.adapters) {
+        for (const rx of a.detection.urlRegexes) {
+          if (rx.test(domain)) return true;
+        }
+      }
+      return false;
+    }
+
+    const rows = Array.from(failByDomain.entries())
+      .map(([domain, { failures, adapters }]) => ({
+        domain,
+        failures,
+        site_adapter_id: adapters.size === 1 ? [...adapters][0] : null,
+        has_adapter: hasAdapter(domain),
+      }))
+      // REVIEW H2 adv: deterministic tiebreak on domain alpha so the UI
+      // table doesn't reorder between refreshes when failure counts tie.
+      .sort((a, b) => b.failures - a.failures || a.domain.localeCompare(b.domain))
+      // REVIEW H2 adv: bound row count — a misbehaving cron could
+      // explode failByDomain; UI table shouldn't paginate beyond 50.
+      .slice(0, 50);
+
+    res.json({ rows, count: rows.length });
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+// ── 07-applier/07-self-iteration/03-iteration-dashboard m1 — event-stream + promote ──
+//
+// 5 endpoints aggregate over existing append-only stores (feedback/*.jsonl
+// + qa-bank/history.jsonl + eval-fixtures/tuner-log.json + applications.json
+// + suggested/*.json). Real-time aggregate (Q2 override) — no new persistent
+// store. See src/career/iteration/eventStream.mjs for the normalization.
+
+import {
+  readEvents as iterationReadEvents,
+  buildHealth as iterationBuildHealth,
+  buildPending as iterationBuildPending,
+  buildCoverage as iterationBuildCoverage,
+} from './src/career/iteration/eventStream.mjs';
+import {
+  promoteEvidence as iterationPromoteEvidence,
+  EVIDENCE_ID_RE as ITERATION_EVIDENCE_ID_RE,
+} from './src/career/iteration/promote.mjs';
+
+app.get('/api/career/iteration/health', async (_req, res) => {
+  try {
+    res.json(await iterationBuildHealth());
+  } catch (err) {
+    console.error('[iteration/health]', err);
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+app.get('/api/career/iteration/events', async (req, res) => {
+  try {
+    const limit =
+      typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined;
+    const beforeTs =
+      typeof req.query.before_ts === 'string' ? req.query.before_ts : undefined;
+    const beforeId =
+      typeof req.query.before_id === 'string' ? req.query.before_id : undefined;
+    const sinceParam =
+      typeof req.query.since === 'string' ? Date.parse(req.query.since) : NaN;
+    const since = Number.isFinite(sinceParam) ? sinceParam : undefined;
+    res.json(await iterationReadEvents({ limit, beforeTs, beforeId, since }));
+  } catch (err) {
+    console.error('[iteration/events]', err);
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+app.get('/api/career/iteration/pending', async (_req, res) => {
+  try {
+    res.json(await iterationBuildPending());
+  } catch (err) {
+    console.error('[iteration/pending]', err);
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+app.get('/api/career/iteration/coverage', async (_req, res) => {
+  try {
+    res.json(await iterationBuildCoverage());
+  } catch (err) {
+    console.error('[iteration/coverage]', err);
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+app.post('/api/career/iteration/promote/:evidenceId', async (req, res) => {
+  try {
+    const id = String(req.params.evidenceId || '');
+    if (!ITERATION_EVIDENCE_ID_RE.test(id)) {
+      return res
+        .status(400)
+        .json({ error: 'evidenceId must be 12-hex sha256 prefix' });
+    }
+    const result = await iterationPromoteEvidence(id);
+    res.status(result.status === 'created' ? 201 : 200).json(result);
+  } catch (err) {
+    if (err?.code === 'EVIDENCE_NOT_FOUND') {
+      return res.status(404).json({ error: err.message });
+    }
+    console.error('[iteration/promote]', err);
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+const port = process.env.PORT || 8000;
+app.listen(port, () => console.log(`API server on :${port}`));
