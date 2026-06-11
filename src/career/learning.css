@@ -9,7 +9,41 @@
 }
 
 .c-learning-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
   margin-bottom: 24px;
+}
+
+/* m4c: manual induction trigger lives at the right of the header. */
+.c-learning-induce {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+.c-learning-induce-btn {
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 14px;
+  border-radius: 6px;
+  border: 1px solid #d6cdb8;
+  background: #ffffff;
+  color: #0c0a08;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.c-learning-induce-btn:hover:not(:disabled) {
+  background: #f5f1e6;
+}
+.c-learning-induce-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.c-learning-induce-msg {
+  font-size: 12px;
+  color: #6b6356;
 }
 
 .c-learning-title {

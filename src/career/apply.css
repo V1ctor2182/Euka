@@ -529,6 +529,44 @@
   margin-left: 6px;
 }
 
+/* m4c: reclassify control — the class badge is a <select>; when the operator
+ * picks a different class it turns amber and (for hard/legal/file) reveals an
+ * optional maps_to dot-path input. */
+.ap-m2-control + .ap-m2-reclass {
+  margin-left: 6px;
+}
+.ap-m2-reclass {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ap-m2-class-select {
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.ap-m2-class-select:hover {
+  border-color: #d6d3d1;
+}
+.ap-m2-reclass-changed .ap-m2-class-select {
+  background: #fef3c7;
+  color: #92400e;
+  border-color: #fcd34d;
+}
+.ap-m2-mapping-input {
+  font-size: 11px;
+  padding: 2px 6px;
+  border: 1px solid #fcd34d;
+  border-radius: 3px;
+  background: #fffbeb;
+  width: 200px;
+}
+.ap-m2-mapping-input:focus {
+  outline: none;
+  border-color: #f59e0b;
+}
+
 .ap-m2-ctrl-hint {
   font-size: 11px;
   color: #6d28d9;

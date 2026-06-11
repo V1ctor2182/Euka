@@ -467,32 +467,51 @@ milestones:
         I: 7. "Why work here?" + 200 字 + 32s → 候选
            8. 2 次同类 → propose narrative.why_this_company
            9. answer < 5s → 排除(可能复制粘贴)
-  - id: "m4c-wire-dormant-capture-hooks"
-    name: "接回 2 条空转的 capture hook(recordVerifyFailure + recordFieldMisclassified)"
-    status: pending
+  - id: "m4c-induction-trigger-and-reclassify"
+    name: "生产归纳触发器(apply 关闭 + 手动按钮)+ reclassify UI → recordFieldMisclassified"
+    status: completed
     estimated_files:
-      - "src/career/applier/multistep/machine.mjs"       # verify 失败分支接 recordVerifyFailure
-      - "src/career/applier/multistep/endpoint.mjs"       # 接线
-      - "src/career/apply/"                               # 最简 reclassify 入口(卡片"分类错了")
-      - "server.mjs"                                       # reclassify REST route
-      - "scripts/smoke-flywheel-dormant-hooks.mjs"        # NEW
-    estimated_lines: 240
+      - "src/career/applier/multistep/endpoint.mjs"       # apply-close maybeInduceAll + recordFieldMisclassified
+      - "server.mjs"                                       # POST /feedback/induce
+      - "src/career/Learning.tsx"                          # "Run induction now" 按钮
+      - "src/career/Apply.tsx"                             # reclassify 下拉 + maps_to 输入
+      - "src/career/apply.css + learning.css"             # 控件样式
+      - "scripts/smoke-flywheel-induce-route.mjs"          # NEW
+    estimated_lines: 320
     depends_on: []
-    complexity_flags: ["bug", "data_integrity"]
+    complexity_flags: ["bug", "data_integrity", "design_decisions"]
     open_questions: []
     description: |
-      来源:2026-06-11 架构评审(grep 确认的真实缺口)。
-      已确认:feedback/stores.mjs 定义了 recordFieldMisclassified +
-      recordVerifyFailure,但生产代码零调用点 —— 对应的 induceClassifierRule +
-      induceVerifyFix 永远收不到输入,飞轮"分类器越来越准"这条腿空转。
-      (对比:recordFieldEdit @endpoint.mjs:683 + recordSiteFailure
-       @endpoint.mjs:1044 已接线。)
-      a. recordVerifyFailure 接在 machine.mjs 读回校验失败分支(not_seen/
-         mismatch/fill_error)→ induceVerifyFix 打通。
-      b. recordFieldMisclassified:approve-step 卡片加最简"这个分类错了"按钮
-         + REST route → induceClassifierRule 打通。
-      注:这是 m5/m6/m7(消费 envelope v2)的前置 —— 先把传感器接全,信号才有源。
-      验收:一次 mismatch → jsonl 出现记录;满 5 → 归纳出规则进建议队列。
+      来源:2026-06-11 架构评审 + m4c 实现期 grep 复核(修正了评审初稿的两处不准)。
+
+      初稿曾说"recordVerifyFailure + recordFieldMisclassified 两条 hook 零调用
+      点"。实现期全仓复核更正:
+        - recordVerifyFailure 不是死的 —— 由 scripts/applier-selftest.mjs:70
+          调用(self-test 喂料口,VerifyFailureSchema 注释写明"by the self-test
+          harness"),按设计如此,不动 live 路径。
+        - recordFieldMisclassified 确实无生产 feeder(仅 smoke 调)。
+        - **更大的缺口**:maybeInduce / induce* 在生产里从来不触发 —— 只在
+          smoke 里被调。endpoint(apply 关闭)+ server(路由)都没有触发归纳。
+          所谓 ROOM COMPLETE 的"端到端闭环"是 smoke 直调 maybeInduce 验的,
+          运行时飞轮的"归纳"这一环是断的。
+
+      本 milestone 把飞轮在运行时真正闭环:
+        1. 归纳触发器(关键):endpoint.mjs apply-close finally → _fireInduction()
+           → maybeInduceAll()(fire-and-forget;cheap groupBy 把关,只有满 5 才
+           调 LLM;getClient() 解析不到 backend 时静默跳过,不刷 warn)。
+        2. 手动触发:server.mjs POST /api/career/feedback/induce → maybeInduceAll;
+           Learning.tsx "Run induction now" 按钮(幂等,induced-markers 防重)。
+        3. reclassify UI:Apply.tsx 字段卡片 class 下拉(预测值高亮,改成别的类即
+           amber)+ hard/legal/file 时显示 maps_to dot-path 输入;approve 时
+           携带 actual_class/actual_mapping。
+        4. 误分类捕获:endpoint.mjs approve-step → recordFieldMisclassified
+           (real→real class 变更才记;synthetic class 用 FIELD_CLASSES 枚举过滤)。
+
+      验证:smoke-flywheel-induce-route 4/4(空库 / 满库 / 幂等 / POST-only);
+      回归 feedback-induce 26 + stats 12 + stores 24 + multistep-endpoint 40 +
+      auto-approve 15 全绿;vite build ✓;无新增 tsc 错误。
+      ⏳ 真实路径(approve-step 误分类捕获 + apply-close 触发)为 smoke/build 验证,
+      端到端待 P0 真实跑确认。
 
 commits:
   - hash: "bd1295b"
