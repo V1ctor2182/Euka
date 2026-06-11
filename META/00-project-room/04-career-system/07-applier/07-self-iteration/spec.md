@@ -86,6 +86,21 @@ apply fail
 
 **80% 完全自动，15% 你点几下按钮，5% 真要写代码**。
 
+## ⏳ 待执行 — P0 真实验证 (来源: 2026-06-11 架构评审)
+
+> 上面的收敛曲线目前是**假设**,不是实测 —— 所有 ROOM COMPLETE 都是 fixture 上的
+> smoke 绿,系统从未在真实 ATS 上端到端跑过。sub-epic 验收 (a)(b)(c) 因此都未达成。
+> **下一步不是加功能,是上路。**
+
+- **V1** — 单 ATS 真实冒烟:挑 Greenhouse/Ashby 真实岗位跑通 1 次(headful / 人审 /
+  不提交),走完 scan→classify→approve→fill→verify,产出断点日志。
+- **V2** — 扩到 3–5 次 × 2 个 ATS,产出《真实 gap 清单》+ 实测 cache-hit / 成功率 /
+  **被不被挡**。这组实测数会重排所有后续优先级(尤其决定 02-playwright/m7 stealth
+  评估的紧迫度)。
+
+验收对齐:V1+V2 完成即兑现本 sub-epic 验收标准 (a);escalation 一次跑通对齐 (b)
+(需 04-flywheel-dashboard 的 Promote 出口);30 天回看对齐 (c)。
+
 ## Specs in this Room
 
 - [intent-self-iteration-001](specs/intent-self-iteration-001.yaml) — Applier 自我迭代体系顶层 intent
