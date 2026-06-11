@@ -292,6 +292,30 @@ milestones:
         - /career/settings/portals UI 加一个新 source + Save → portals.yml 写入
         - 删除 source + Save → portals.yml 该行不见
         - dirty + 关页面 → beforeunload 拦截
+  - id: "m5-scrapling-stealth-fetch-adaptive-parse"
+    name: "Scrapling 引入 — StealthyFetcher 抓挡 bot 的 JD + 自适应解析自愈"
+    status: pending
+    estimated_files:
+      - "META/00-project-room/04-career-system/05-finder/01-source-adapters/FD-INTEGRATION.md"  # FD-0 集成方式决策
+      - "src/career/finder/adapters/"                    # 接入点
+      - "scripts/smoke-scrapling-fetch.mjs"              # NEW
+    estimated_lines: 360
+    depends_on: []
+    complexity_flags: ["design_decisions", "external_dep", "cross_language"]
+    open_questions:
+      - "FD-0 集成方式:Python 子进程 CLI(scrapling extract)/ 本地 MCP server(scrapling[ai])/ 只借鉴 adaptive 算法用 JS 重写"
+    description: |
+      来源:2026-06-11 架构评审。Scrapling 是 scraping 库,正是 finder 的主场
+      (爬 Greenhouse/Ashby/Lever + JD 页),比用在 applier 投入产出比高得多。
+      ⚠️ 跨语言:Scrapling 是 Python,本项目是 Node。落地前先定 FD-0 集成方式。
+      FD-0(决策先行):Python 子进程 CLI / 本地 MCP server(scrapling[ai] 自带,
+                       且对 LLM 友好)/ 只借鉴 adaptive 相似度算法用 JS 重写。
+      FD-1:StealthyFetcher(TLS 指纹 + Cloudflare Turnstile)接入 JD enrich
+            (跨 Room → 05-finder/04-jd-enrich)—— 抓之前挡在 bot 检测后的
+            岗位详情页正文。
+      FD-2:自适应解析(auto_save + adaptive 相似度重定位)接 source-adapters ——
+            站点改版后 adapter 不直接挂。
+      验收:之前抓不到正文的 JD 页能拿到;模拟站点改版后 adapter 仍能解析。
 
 commits: []
 

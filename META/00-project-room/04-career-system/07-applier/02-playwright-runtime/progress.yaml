@@ -453,6 +453,32 @@ milestones:
           9. text input clear
           10. select dropdown reset to index 0
           11. file input setInputFiles([]) 清空
+  - id: "m7-stealth-eval-camoufox-spike"
+    name: "stealth 评估 spike — 当前栈 vs camoufox/TLS 指纹(决策,不强制迁移)"
+    status: pending
+    estimated_files:
+      - "scripts/stealth-bench.mjs"                       # NEW 检测对照 harness
+      - "META/00-project-room/04-career-system/07-applier/02-playwright-runtime/STEALTH-EVAL.md"  # 决策报告
+    estimated_lines: 220
+    depends_on: []
+    complexity_flags: ["spike", "design_decisions"]
+    open_questions:
+      - "是否真有 ATS 挡住当前 playwright-extra stealth 栈(需 P0 真实 run 证据)"
+      - "迁移最大风险:snapshot 层依赖 CDP Accessibility.getFullAXTree(Chrome-only);camoufox 是 Firefox,换内核会整层重写"
+    description: |
+      来源:2026-06-11 架构评审 + Scrapling 借鉴(StealthyFetcher/camoufox/TLS)。
+      ⚠️ GATED:建议 P0 真实 run 之后再做 —— 没有"真被挡"证据先不换浏览器内核。
+      当前栈 playwright-extra + puppeteer-extra-plugin-stealth 指纹已被主流
+      bot 检测识别;但本 applier 是 headful + 持久化真人 profile,本身比无头
+      stealth 更难检测,所以这是"评估,不一定换"。
+      ST-1:stealth 检测对照 harness — 当前栈在 bot.sannysoft / creepjs 跑分基线。
+      ST-2:camoufox(硬化 Firefox)/ TLS 指纹伪装 spike + 迁移成本评估。
+            ⚠️ 关键风险:整个 snapshot 层(snapshot.mjs)用 CDP
+            Accessibility.getFullAXTree —— 这是 Chrome DevTools Protocol,
+            Chrome 独有。换 camoufox(Firefox)= snapshot + refTable 全层重写。
+            这条几乎否决了"换内核",更可能的结论是强化现有 Chrome stealth。
+      产出:一份"换 / 不换 + 为什么"的决策报告(STEALTH-EVAL.md),本 milestone
+      不做迁移。
 
 commits:
   - hash: "e619833"

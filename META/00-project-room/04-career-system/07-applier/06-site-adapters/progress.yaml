@@ -360,6 +360,37 @@ milestones:
         6. .optional() 兼容:adapter 全没新字段 → default 行为
         7. 类型错误(max_size_mb 是 string)→ Zod reject
         8. 跨多个新 block 同时配置 → 互不冲突 + 都生效
+  - id: "m5-self-healing-element-relocation"
+    name: "self-healing 选择器 — 元素签名 + 相似度重定位(role+name 落空兜底)"
+    status: pending
+    estimated_files:
+      - "src/career/applier/siteAdapters/schema.mjs"      # element_signature block
+      - "src/career/applier/runtime/relocate.mjs"         # NEW 相似度重定位
+      - "src/career/applier/multistep/stepProbe.mjs"      # 接 fallback 链
+      - "src/career/feedback/induceSiteAdapter.mjs"       # 重定位成功回写新签名
+      - "scripts/smoke-self-healing-relocate.mjs"         # NEW
+    estimated_lines: 420
+    depends_on:
+      - "m4-schema-v2-flywheel-rule-types"
+    complexity_flags: ["design_decisions", "algorithm"]
+    open_questions:
+      - "相似度评分权重(role 必配 / name 编辑距离 / 邻居文本 / 属性指纹)"
+      - "重定位阈值定多少才不误命中错误按钮(negative fixture 误命中率应为 0)"
+    description: |
+      来源:2026-06-11 架构评审 + Scrapling 借鉴(adaptive element relocation)。
+      现状:next/submit 按钮靠 getByRole('button',{name:/hint/i}) 定位
+      (stepProbe.mjs:202/243),已是语义优先、抗 CSS 改版。残留脆点很窄 ——
+      只有"无障碍名本身变了"(Next→Continue / i18n / 自定义 div 假按钮无 role)
+      时 role+name 同时落空,才掉到脆的 CSS selectors fallback,今天靠飞轮事后补救。
+      本 milestone 加一个事前自愈兜底层:
+        1. schema v2 加 element_signature:{role, name, neighbor_texts[],
+           attr_fingerprint}(可序列化进 site-adapter yaml,Zod 校验)
+        2. relocate.mjs:role 必配 + name 编辑距离 + 邻居文本重叠 + 属性指纹
+           → 评分 → 超阈值认作"同一元素"
+        3. 接进 stepProbe fallback 链:role+name 落空 → 相似度重定位 → CSS
+        4. 重定位成功后 induceSiteAdapter 回写新签名(下次直接命中)
+      验收:fixture 把 "Next"→"Continue" / 加 i18n 前缀仍能认出同一按钮;
+      negative fixture 误命中率 = 0。
 
 commits:
   - hash: "cb5bc3e"

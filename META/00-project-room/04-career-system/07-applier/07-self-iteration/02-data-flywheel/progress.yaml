@@ -467,6 +467,32 @@ milestones:
         I: 7. "Why work here?" + 200 字 + 32s → 候选
            8. 2 次同类 → propose narrative.why_this_company
            9. answer < 5s → 排除(可能复制粘贴)
+  - id: "m4c-wire-dormant-capture-hooks"
+    name: "接回 2 条空转的 capture hook(recordVerifyFailure + recordFieldMisclassified)"
+    status: pending
+    estimated_files:
+      - "src/career/applier/multistep/machine.mjs"       # verify 失败分支接 recordVerifyFailure
+      - "src/career/applier/multistep/endpoint.mjs"       # 接线
+      - "src/career/apply/"                               # 最简 reclassify 入口(卡片"分类错了")
+      - "server.mjs"                                       # reclassify REST route
+      - "scripts/smoke-flywheel-dormant-hooks.mjs"        # NEW
+    estimated_lines: 240
+    depends_on: []
+    complexity_flags: ["bug", "data_integrity"]
+    open_questions: []
+    description: |
+      来源:2026-06-11 架构评审(grep 确认的真实缺口)。
+      已确认:feedback/stores.mjs 定义了 recordFieldMisclassified +
+      recordVerifyFailure,但生产代码零调用点 —— 对应的 induceClassifierRule +
+      induceVerifyFix 永远收不到输入,飞轮"分类器越来越准"这条腿空转。
+      (对比:recordFieldEdit @endpoint.mjs:683 + recordSiteFailure
+       @endpoint.mjs:1044 已接线。)
+      a. recordVerifyFailure 接在 machine.mjs 读回校验失败分支(not_seen/
+         mismatch/fill_error)→ induceVerifyFix 打通。
+      b. recordFieldMisclassified:approve-step 卡片加最简"这个分类错了"按钮
+         + REST route → induceClassifierRule 打通。
+      注:这是 m5/m6/m7(消费 envelope v2)的前置 —— 先把传感器接全,信号才有源。
+      验收:一次 mismatch → jsonl 出现记录;满 5 → 归纳出规则进建议队列。
 
 commits:
   - hash: "bd1295b"
@@ -505,6 +531,15 @@ commits:
       - "room.yaml lifecycle: planning → active"
       - "_tree.yaml 02-data-flywheel: planning → active"
       - "self-iteration parent: 0% → 33% (1/3 子 Rooms ✅)"
+  - hash: "351abd8"
+    date: "2026-06-11"
+    message: "[04-career-system/07-applier/07-self-iteration/02-data-flywheel] docs: add data flywheel ARCHITECTURE.md + link from spec.md"
+    files_changed: 2
+    specs_affected:
+      - "spec.md (added Architecture section linking ARCHITECTURE.md)"
+    milestones_affected: []
+    rollups:
+      - "docs-only — no milestone/completion change (Room already COMPLETE)"
       - "07-applier: 88% → 91%"
       - "04-career-system: 97% → 98%"
 current_sprint: "Sprint 21 — ROOM REOPEN: post-fill-handoff-ux Phase 5 (9 signals A-I)"
