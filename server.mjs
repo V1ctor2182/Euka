@@ -135,6 +135,10 @@ import {
   readJsonl as feedbackReadJsonl,
   _FILES as FEEDBACK_FILES,
 } from './src/career/feedback/stores.mjs';
+// m4c: manual induction trigger. Apply-close already fires this automatically;
+// this route backs the Learning tab "Run induction now" button so the operator
+// can force a flywheel pass without finishing an apply.
+import { maybeInduceAll as feedbackMaybeInduceAll } from './src/career/feedback/induce.mjs';
 
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
 const app = express();
@@ -6022,6 +6026,19 @@ app.post('/api/career/feedback/suggestions/:id/reject', async (req, res) => {
       return res.status(status).json({ error: String(err?.message ?? err).slice(0, 300) });
     }
     res.status(200).json(result);
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
+  }
+});
+
+// m4c: force a flywheel induction pass across all feedback types. Returns the
+// newly-created proposals (already persisted to feedback/suggested/ and shown
+// in GET /suggestions). Idempotent — induced-markers.json prevents re-inducing
+// the same cluster, so repeated calls return [] until new feedback accrues.
+app.post('/api/career/feedback/induce', async (_req, res) => {
+  try {
+    const proposals = await feedbackMaybeInduceAll();
+    res.status(200).json({ induced: proposals.length, proposals });
   } catch (err) {
     res.status(500).json({ error: String(err?.message ?? err).slice(0, 300) });
   }

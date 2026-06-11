@@ -237,6 +237,11 @@ export default function Apply() {
   const [error, setError] = useState<string | null>(null)
   const [autoApprove, setAutoApprove] = useState(false)
   const [edits, setEdits] = useState<Record<string, string>>({})
+  // m4c: reclassify overlays — refId → corrected class / maps_to dot-path.
+  // Empty until the operator changes a field's class dropdown; sent on Approve
+  // so the endpoint can record a field-misclassified flywheel signal.
+  const [classEdits, setClassEdits] = useState<Record<string, string>>({})
+  const [mappingEdits, setMappingEdits] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
   const [marking, setMarking] = useState(false)
   const [markToast, setMarkToast] = useState<string | null>(null)
@@ -462,6 +467,9 @@ export default function Apply() {
       if (f.refId) seed[f.refId] = f.suggested_value ?? ''
     }
     setEdits(seed)
+    // m4c: a fresh step's classifications start un-corrected.
+    setClassEdits({})
+    setMappingEdits({})
   }
 
   async function poll() {
@@ -570,14 +578,37 @@ export default function Apply() {
     setBusy(true)
     setError(null)
     try {
-      // Only send fields the operator actually changed.
-      const editList: { refId: string; suggested_value: string | null }[] = []
+      // Only send fields the operator actually changed — either the value
+      // or (m4c) the class. A class-only change still needs to go so the
+      // endpoint can record the field-misclassified flywheel signal.
+      const editList: {
+        refId: string
+        suggested_value: string | null
+        actual_class?: string
+        actual_mapping?: string | null
+      }[] = []
       for (const f of pending.draft.fields) {
         if (!f.refId) continue
         const next = edits[f.refId]
-        if (next !== undefined && next !== (f.suggested_value ?? '')) {
-          editList.push({ refId: f.refId, suggested_value: next })
+        const valueChanged = next !== undefined && next !== (f.suggested_value ?? '')
+        const newClass = classEdits[f.refId]
+        const classChanged = newClass !== undefined && newClass !== f.class
+        if (!valueChanged && !classChanged) continue
+        const item: {
+          refId: string
+          suggested_value: string | null
+          actual_class?: string
+          actual_mapping?: string | null
+        } = {
+          refId: f.refId,
+          suggested_value: valueChanged ? next : (f.suggested_value ?? ''),
         }
+        if (classChanged) {
+          item.actual_class = newClass
+          const m = mappingEdits[f.refId]
+          item.actual_mapping = m && m.trim() ? m.trim() : null
+        }
+        editList.push(item)
       }
       const r = await fetch(
         api(`/applier/multi-step/${encodeURIComponent(jobId)}/approve-step`),
@@ -656,6 +687,8 @@ export default function Apply() {
     }
     setStatus(null)
     setEdits({})
+    setClassEdits({})
+    setMappingEdits({})
     pendingKeyRef.current = null
     setPhase('idle')
     setBusy(false)
@@ -1167,6 +1200,10 @@ export default function Apply() {
               pending={pending}
               edits={edits}
               setEdits={setEdits}
+              classEdits={classEdits}
+              setClassEdits={setClassEdits}
+              mappingEdits={mappingEdits}
+              setMappingEdits={setMappingEdits}
               onApprove={() => approveStep(true)}
               onCancel={cancelApply}
               busy={busy}
@@ -1370,11 +1407,73 @@ function ProgressBar({ session, machine }: { session: Session; machine: Machine 
   )
 }
 
+// m4c: the 4 real classifier classes the operator can reclassify a field to.
+// Synthetic UI classes (manual/captcha) aren't reclassifiable — their badge
+// renders static. 'maps_to' dot-paths are only meaningful for hard/legal/file.
+const RECLASSIFIABLE = ['hard', 'legal', 'open', 'file'] as const
+const NEEDS_MAPPING = new Set(['hard', 'legal', 'file'])
+
+// Class badge that doubles as a reclassify control. For a real classifier
+// class it renders a <select> (defaulting to the predicted class); picking a
+// different class records a field-misclassified flywheel signal on Approve.
+// When the corrected class is hard/legal/file, an optional maps_to dot-path
+// input appears. Synthetic classes (manual, etc.) render the static badge.
+function ReclassifyControl({
+  refId,
+  predicted,
+  classEdits,
+  setClassEdits,
+  mappingEdits,
+  setMappingEdits,
+}: {
+  refId: string
+  predicted: string
+  classEdits: Record<string, string>
+  setClassEdits: React.Dispatch<React.SetStateAction<Record<string, string>>>
+  mappingEdits: Record<string, string>
+  setMappingEdits: React.Dispatch<React.SetStateAction<Record<string, string>>>
+}) {
+  if (!(RECLASSIFIABLE as readonly string[]).includes(predicted)) {
+    return <span className="ap-m2-class">{predicted}</span>
+  }
+  const cls = classEdits[refId] ?? predicted
+  const changed = cls !== predicted
+  const needsMapping = changed && NEEDS_MAPPING.has(cls)
+  return (
+    <span className={`ap-m2-reclass${changed ? ' ap-m2-reclass-changed' : ''}`}>
+      <select
+        className="ap-m2-class ap-m2-class-select"
+        value={cls}
+        title={changed ? `reclassified from "${predicted}"` : 'class — change if misclassified'}
+        onChange={(e) => setClassEdits((prev) => ({ ...prev, [refId]: e.target.value }))}
+      >
+        {RECLASSIFIABLE.map((c) => (
+          <option key={c} value={c}>
+            {c === predicted ? c : `${c} ✦`}
+          </option>
+        ))}
+      </select>
+      {needsMapping && (
+        <input
+          className="ap-m2-mapping-input"
+          placeholder="maps_to dot-path (optional)"
+          value={mappingEdits[refId] ?? ''}
+          onChange={(e) => setMappingEdits((prev) => ({ ...prev, [refId]: e.target.value }))}
+        />
+      )}
+    </span>
+  )
+}
+
 // ── Approval panel ──────────────────────────────────────────────────────
 function ApprovalPanel({
   pending,
   edits,
   setEdits,
+  classEdits,
+  setClassEdits,
+  mappingEdits,
+  setMappingEdits,
   onApprove,
   onCancel,
   busy,
@@ -1382,6 +1481,10 @@ function ApprovalPanel({
   pending: Pending
   edits: Record<string, string>
   setEdits: React.Dispatch<React.SetStateAction<Record<string, string>>>
+  classEdits: Record<string, string>
+  setClassEdits: React.Dispatch<React.SetStateAction<Record<string, string>>>
+  mappingEdits: Record<string, string>
+  setMappingEdits: React.Dispatch<React.SetStateAction<Record<string, string>>>
   onApprove: () => void
   onCancel: () => void
   busy: boolean
@@ -1413,7 +1516,14 @@ function ApprovalPanel({
               <div className="ap-field-head">
                 <span className="ap-field-label">{f.label}</span>
                 <span className={`ap-m2-control ap-m2-control-${ctrl}`}>{meta.label}</span>
-                <span className="ap-m2-class">{f.class}</span>
+                <ReclassifyControl
+                  refId={refId}
+                  predicted={f.class}
+                  classEdits={classEdits}
+                  setClassEdits={setClassEdits}
+                  mappingEdits={mappingEdits}
+                  setMappingEdits={setMappingEdits}
+                />
                 {f.confidence && (
                   <span className={`ap-confidence ap-conf-${f.confidence}`}>
                     {f.confidence}

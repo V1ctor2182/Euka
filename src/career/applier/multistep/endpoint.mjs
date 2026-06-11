@@ -33,7 +33,7 @@ import {
 // Field-classifier LLM context. The open-ended + file fillers need a
 // client / pricing / identity injected via classifierCtx — without them
 // every open question and the resume upload come back empty.
-import { getClient } from '../../lib/anthropicClient.mjs';
+import { getClient, ConfigError } from '../../lib/anthropicClient.mjs';
 import { computeCostUsd } from '../../lib/anthropicPricing.mjs';
 import { loadIdentity } from '../classifier/identityLookup.mjs';
 import { runMachine as realRunMachine, OUTCOME } from './machine.mjs';
@@ -88,10 +88,48 @@ import { humanNavigate } from '../runtime/humanize.mjs';
 // (caught + logged; never break the apply).
 import {
   recordFieldEdit,
+  recordFieldMisclassified,
   recordSiteFailure,
   editDistance,
   classifyError,
 } from '../../feedback/stores.mjs';
+// m4c: trigger Haiku induction on apply close. maybeInduceAll runs a cheap
+// groupBy over each feedback flywheel and only calls the LLM when a group
+// hits the threshold (5) — so firing it on every close is safe + idempotent
+// (induced-markers.json prevents re-inducing the same batch). Fire-and-forget;
+// induction never blocks or breaks the apply lifecycle.
+import { maybeInduceAll } from '../../feedback/induce.mjs';
+
+// The 4 real classifier classes (mirrors draftsStore FIELD_CLASSES). Synthetic
+// UI classes like 'manual' are intentionally excluded — they can't be a
+// predicted_class in the field-misclassified flywheel.
+const FIELD_CLASSES = ['hard', 'legal', 'open', 'file'];
+
+// Fire Haiku induction across all flywheels after an apply settles. Best-effort
+// — logs new proposals, swallows failures (network/LLM) so a degraded LLM
+// backend can never wedge the apply close path.
+function _fireInduction() {
+  // Skip silently when no LLM backend is configured. Induction can't run
+  // without one, and we don't want every apply-close (incl. smoke runs)
+  // spamming "No LLM backend configured" warnings. getClient() is cheap +
+  // memoized — it resolves the backend, it doesn't make a network call.
+  try {
+    getClient();
+  } catch (err) {
+    if (err instanceof ConfigError) return;
+    // Unexpected error resolving the client — let maybeInduceAll surface it.
+  }
+  Promise.resolve()
+    .then(() => maybeInduceAll())
+    .then((proposals) => {
+      if (proposals.length) {
+        console.log(`feedback: apply-close induction produced ${proposals.length} new proposal(s)`);
+      }
+    })
+    .catch((err) => {
+      console.warn('feedback: apply-close maybeInduceAll failed:', err?.message ?? err);
+    });
+}
 
 // ── In-memory controller registry ───────────────────────────────────
 //
@@ -619,6 +657,10 @@ export async function startMachine(body, deps = {}) {
         } catch {}
         ctrl.pendingApproval = null;
       }
+      // m4c: apply has settled — fire the induction flywheel. The cheap
+      // groupBy gates the LLM call, so this is a no-op unless some
+      // failure/edit/misclassification cluster has reached threshold.
+      _fireInduction();
       // Keep ctrl in the map briefly so getStatus can report the
       // terminal outcome; clean up after a grace window so the next
       // start for the same jobId can proceed.
@@ -671,6 +713,35 @@ export function approveStep(jobId, body) {
       if (!edit || !edit.refId) continue;
       const field = fieldMap.get(edit.refId);
       if (!field) continue;
+      // m4c: capture a class correction (misclassification) — independent of
+      // any value edit. Only real→real class changes feed the flywheel;
+      // synthetic classes (manual/file-synthetic) are excluded via the enum
+      // guard. actual_mapping is the dot-path the operator optionally supplies
+      // for hard/legal/file; null otherwise. Best-effort fire-and-forget.
+      const actualClass = typeof edit.actual_class === 'string' ? edit.actual_class : null;
+      if (
+        actualClass &&
+        FIELD_CLASSES.includes(actualClass) &&
+        FIELD_CLASSES.includes(field.class) &&
+        actualClass !== field.class
+      ) {
+        const mapping =
+          typeof edit.actual_mapping === 'string' && edit.actual_mapping.trim()
+            ? edit.actual_mapping.trim().slice(0, 200)
+            : null;
+        recordFieldMisclassified({
+          ts: new Date().toISOString(),
+          jobId,
+          field_label: String(field.label || '').slice(0, 400),
+          refId: edit.refId,
+          predicted_class: field.class,
+          actual_class: actualClass,
+          actual_mapping: mapping,
+          site: ctrl.siteAdapter || 'unknown',
+        }).catch((err) => {
+          console.warn('feedback: recordFieldMisclassified failed:', err.message);
+        });
+      }
       // REVIEW H2 (adv) fix: slice BEFORE computing distance so the
       // recorded suggested/user_final and the recorded edit_distance
       // agree. Pre-fix, two strings differing only past index 8000

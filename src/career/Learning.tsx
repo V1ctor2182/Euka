@@ -77,6 +77,10 @@ export default function Learning() {
   const [coverageError, setCoverageError] = useState<string | null>(null)
   const [actionBusy, setActionBusy] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  // m4c: manual induction trigger state. Apply-close fires induction
+  // automatically; this lets the operator force a pass on demand.
+  const [inducing, setInducing] = useState(false)
+  const [induceMsg, setInduceMsg] = useState<string | null>(null)
   // REVIEW C3 (adv) fix: a ref mirroring actionBusy that the
   // setInterval auto-refresh can read synchronously (state updates are
   // async; the interval tick captured at mount sees a stale value).
@@ -176,6 +180,33 @@ export default function Learning() {
     }
   }
 
+  // m4c: force a flywheel induction pass. Idempotent server-side — returns
+  // only NEW proposals, so repeated clicks return 0 until fresh feedback
+  // accrues. Refreshes the suggestions list on success.
+  async function runInductionNow() {
+    setInducing(true)
+    actionBusyRef.current = 'induce'
+    setInduceMsg(null)
+    setActionError(null)
+    const ac = new AbortController()
+    try {
+      const r = await fetch('/api/career/feedback/induce', { method: 'POST', signal: ac.signal })
+      const j = (await r.json().catch(() => ({}))) as { induced?: number; error?: string }
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`)
+      const n = j.induced ?? 0
+      if (mountedRef.current) {
+        setInduceMsg(n > 0 ? `${n} new suggestion${n === 1 ? '' : 's'}` : 'No new suggestions (nothing at threshold)')
+        await fetchAll(ac.signal)
+      }
+    } catch (e) {
+      if ((e as { name?: string })?.name === 'AbortError') return
+      if (mountedRef.current) setActionError((e as Error).message)
+    } finally {
+      if (mountedRef.current) setInducing(false)
+      actionBusyRef.current = null
+    }
+  }
+
   const lineData = useMemo(() => {
     // REVIEW H6 / #3 fix: drop the empty-string-x fallback. The chart
     // is only rendered when `stats` is loaded (gate below), so we only
@@ -192,10 +223,24 @@ export default function Learning() {
   return (
     <div className="c-learning-root">
       <header className="c-learning-header">
-        <h2 className="c-learning-title">Learning</h2>
-        <p className="c-learning-sub">
-          Applier 越用越准 — 4 条飞轮数据 · AI 归纳的规则建议 · 站点覆盖度
-        </p>
+        <div className="c-learning-header-main">
+          <h2 className="c-learning-title">Learning</h2>
+          <p className="c-learning-sub">
+            Applier 越用越准 — 4 条飞轮数据 · AI 归纳的规则建议 · 站点覆盖度
+          </p>
+        </div>
+        <div className="c-learning-induce">
+          <button
+            type="button"
+            className="c-learning-induce-btn"
+            onClick={runInductionNow}
+            disabled={inducing}
+            title="Run Haiku induction across all flywheels now (also fires automatically after each apply)"
+          >
+            {inducing ? 'Inducing…' : 'Run induction now'}
+          </button>
+          {induceMsg && <span className="c-learning-induce-msg">{induceMsg}</span>}
+        </div>
       </header>
 
       {/* Card ①: 30-day flywheel stats */}
