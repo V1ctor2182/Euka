@@ -505,6 +505,15 @@ commits:
       - "room.yaml lifecycle: planning → active"
       - "_tree.yaml 02-data-flywheel: planning → active"
       - "self-iteration parent: 0% → 33% (1/3 子 Rooms ✅)"
+  - hash: "351abd8"
+    date: "2026-06-11"
+    message: "[04-career-system/07-applier/07-self-iteration/02-data-flywheel] docs: add data flywheel ARCHITECTURE.md + link from spec.md"
+    files_changed: 2
+    specs_affected:
+      - "spec.md (added Architecture section linking ARCHITECTURE.md)"
+    milestones_affected: []
+    rollups:
+      - "docs-only — no milestone/completion change (Room already COMPLETE)"
       - "07-applier: 88% → 91%"
       - "04-career-system: 97% → 98%"
 current_sprint: "Sprint 21 — ROOM REOPEN: post-fill-handoff-ux Phase 5 (9 signals A-I)"
