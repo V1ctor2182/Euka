@@ -55,8 +55,13 @@ data/career/qa-bank/legal.yml
 data/career/qa-bank/history.jsonl
 data/career/qa-bank/templates.md
 
-# Resumes: actual content is private (keep README + .gitkeep)
-data/career/resumes/*/
+# Resumes: actual content is private (keep README + .gitkeep). The `*/`
+# pattern alone only covered subdirs — real resumes dropped directly into
+# resumes/ (e.g. a .pdf) leaked. Ignore everything, un-ignore the 2 tracked
+# scaffold files.
+data/career/resumes/*
+!data/career/resumes/.gitkeep
+!data/career/resumes/README.md
 data/career/portals.yml
 
 # Generated / transient outputs
