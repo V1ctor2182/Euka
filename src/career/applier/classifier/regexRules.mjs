@@ -74,7 +74,12 @@ export const LEGAL_PATTERNS = Object.freeze([
   // H8 fix: add visa status (Workday phrasing)
   {
     regex: /sponsor(ship)?|visa.*(now|future)|require.*sponsor|need.*sponsor|visa ?(status|type|category)|h-?1b/i,
-    lookupKey: 'work_authorization.requires_sponsorship_now',
+    // G1 fix (2026-06-11 P0 run): "now OR in the future require sponsorship?"
+    // must answer Yes if sponsorship is needed now OR future. The old
+    // requires_sponsorship_now mapping made an F-1 OPT applicant falsely
+    // answer "No". requires_sponsorship_ever is computed (now || future) in
+    // legalLookup.
+    lookupKey: 'work_authorization.requires_sponsorship_ever',
     subclass: 'sponsorship',
   },
   // H11 fix: cover Lever "lawfully" phrasing
