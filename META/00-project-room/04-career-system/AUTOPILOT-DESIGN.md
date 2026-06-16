@@ -42,11 +42,26 @@ That's it. The "intelligence" is the agent (me), not a harness.
 
 ## 3. The goal & the metric
 
-- **Goal (your decision):** the full chain **find → … → submit** succeeds
-  **once**, end-to-end, on a real posting (throwaway identity). One success = done.
-- **Metric per iteration:** how much of the form filled correctly on its own
-  (autonomy %) + did submit land. I report this each loop by reading the run;
-  if you want a hard, objective number, keep the optional scorecard (§6).
+- **Ultimate goal:** automatically find jobs and reach **100% auto-apply per
+  ATS** (Greenhouse → Ashby → Lever → Workday …) — find → fill → submit, with
+  the human touch shrinking to ~zero on the ATSs that allow it.
+- **Decision (2026-06-16, updated — supersedes the earlier throwaway-identity
+  plan):** experiment with **real data + the real résumé**, applying to jobs the
+  owner would actually take. The submit is then a *genuine* application — no
+  fake-to-real-company spam, and it validates submit for real.
+- **Metric:** **autonomy % per ATS** = fields auto-filled-correct / required,
+  plus "did the form's validation pass + submit land." Tracked per ATS because
+  they fail differently. The loop drives each ATS's number to 100%, one at a time.
+- **Convergence, not one-shot:** every miss found in a round → fixed → added to
+  regression → caught forever after. An ATS is "solved" when autonomy hits 100%
+  with zero validation misses across N real jobs; then re-point the loop.
+
+### ⚠️ Honest ceiling per ATS
+Greenhouse / Ashby / Lever (single-page or simple multi-step, usually no login)
+→ **100% auto is realistic**. **Workday** (account + login + multi-page + heavy
+JS + frequent CAPTCHA) → CAPTCHA is a hard human gate (iron rule), so Workday
+caps at "auto-fill ~95% + you clear login/CAPTCHA." Solve the 100%-able ATSs
+first; bank the wins; then tackle Workday knowing some steps stay human.
 
 ## 4. The `/loop` — what you actually run
 
@@ -66,6 +81,44 @@ That's it. The "intelligence" is the agent (me), not a harness.
 - **Self-paced** (no interval) — each iteration is a fix, not a timer.
 - **One commit per fix** — checkpointed, you can see/revert/interrupt anytime.
 - **Smokes each round** — green before continuing (no thrashing).
+
+## 4a. What ONE loop iteration actually does (the 9 steps)
+
+```
+For a target job on a target ATS:
+1 SELECT   pick/confirm the target (one ATS at a time, e.g. Greenhouse)
+2 RUN      drive apply: fill every field up to the submit gate
+           📸 capture per-step screenshots + a final full-page shot (MANDATORY)
+3 PROBE    click submit to trigger the FORM'S OWN validation → read the
+           "missing required" errors it lists. 📸 screenshot the post-validation
+           page. Do NOT complete the submission (unless this run is all-green = the
+           real final submit). This respects "never auto-submit" while using the
+           form's validation as ground truth for completeness.
+4 MEASURE  fuse 4 detectors into the run-report (§4b)
+5 DECIDE   pick the single gap that unblocks the most autonomy
+6 FIX      data → YAML/profile; code → snapshot/classifier/submitFlow; ATS quirk
+           → add/extend that ATS's adapter (greenhouse.yml / workday.yml)
+7 VERIFY   smokes green + re-run/replay → autonomy ↑ and nothing regressed
+8 COMMIT   checkpoint; add the failing case to regression (permanent guard)
+9 LOOP     repeat until autonomy 100% AND validation reports zero missing → then
+           the final run actually submits (a real application).
+```
+
+## 4b. How each round finds problems (completeness model)
+
+No single detector is complete — read-back's denominator can even lie (it can't
+count fields it never perceived). Completeness comes from fusing four, with the
+form's own validation as the closest thing to ground truth:
+
+```
+DOM read-back       cheap first pass; mechanical errors (filled? landed?)  — incomplete
++ agent reads        screenshot + answers → "filled-wrong / never-seen / low-quality"
++ form validation    PROBE submit → the ATS itself lists what's missing      ← most complete
++ your final glance  last human check before the real submit                 ← backstop
+```
+
+Screenshots are a first-class input every round (step 2 + 3) — they're how the
+agent sees what the DOM missed and confirms the submit landed.
 
 ## 5. Human gates (where `/loop` pauses — by design)
 
