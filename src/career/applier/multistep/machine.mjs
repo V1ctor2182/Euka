@@ -1154,15 +1154,18 @@ export async function runMachine(args, deps = {}) {
         isSubmit = await resolved._isOnSubmitStep(page, session.site_adapter);
       } catch {}
       if (isSubmit && session.current_step > 0) {
-        // m6: multi-step Submit page. runSubmitLoop owns submit + errors.
-        const loopRes = await runSubmitLoopHelper({
-          jobId, session, page, siteAdapter: session.site_adapter, deps: resolved,
-        });
-        const d = dispatchLoopOutcome(loopRes);
-        session = d.session;
-        outcome = d.outcome;
-        if (d.errorMsg) errorMsg = d.errorMsg;
-        if (d.loopOutcomeMeta) loopOutcomeMeta = d.loopOutcomeMeta;
+        // A-fix (2026-06-12): IRON RULE — never auto-submit. Multi-step
+        // Review/Submit page reached; the prior steps are filled+approved.
+        // Hand off to the operator to review + click Submit in the browser
+        // rather than running the submit-first loop (which auto-submitted).
+        outcome = OUTCOME.ESCALATED;
+        loopOutcomeMeta = {
+          escalation_reason: {
+            code: 'ready_for_submit',
+            detail:
+              'Form filled — review and click Submit yourself in the browser. The applier never auto-submits.',
+          },
+        };
         break;
       }
 
@@ -1195,15 +1198,21 @@ export async function runMachine(args, deps = {}) {
       // can land submit, COMPLETED. If guards trip, ESCALATED (operator
       // takes over in browser).
       if (isSubmit) {
-        // m6: single-page form post-runStep. Same dispatch as multi-step.
-        const loopRes = await runSubmitLoopHelper({
-          jobId, session, page, siteAdapter: session.site_adapter, deps: resolved,
-        });
-        const d = dispatchLoopOutcome(loopRes);
-        session = d.session;
-        outcome = d.outcome;
-        if (d.errorMsg) errorMsg = d.errorMsg;
-        if (d.loopOutcomeMeta) loopOutcomeMeta = d.loopOutcomeMeta;
+        // A-fix (2026-06-12): IRON RULE — the applier NEVER auto-submits.
+        // m6's submit-first loop clicked Submit on single-page forms and
+        // marked COMPLETED on success — i.e. it auto-submitted the
+        // application, regressing the Human Gate. The form is now filled;
+        // hand off to the operator to review + click Submit in the browser.
+        // (runSubmitLoopHelper/dispatchLoopOutcome retained for a possible
+        // future explicit-confirm submit path, but are no longer invoked.)
+        outcome = OUTCOME.ESCALATED;
+        loopOutcomeMeta = {
+          escalation_reason: {
+            code: 'ready_for_submit',
+            detail:
+              'Form filled — review and click Submit yourself in the browser. The applier never auto-submits.',
+          },
+        };
         break;
       }
 
