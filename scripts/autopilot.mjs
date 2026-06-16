@@ -15,6 +15,7 @@ import { readdirSync, existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { APPLY_SESSIONS_DIR } from '../src/career/applier/multistep/applySessionsStore.mjs';
 import { diagnoseRun, summarizeRun, LANE } from '../src/career/autopilot/diagnose.mjs';
+import { reviewFilledAnswers } from '../src/career/autopilot/semanticReview.mjs';
 
 const JOB_RE = /^[a-f0-9]{12}$/;
 
@@ -51,9 +52,10 @@ function bar(rate) {
   return `[${'█'.repeat(n)}${'░'.repeat(20 - n)}] ${Math.round(rate * 100)}%`;
 }
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   const asJson = args.includes('--json');
+  const withReview = args.includes('--review'); // detector #2 (real claude -p call)
   const jobId = args.find((a) => JOB_RE.test(a));
 
   if (!jobId) {
@@ -77,7 +79,17 @@ function main() {
     console.error(`No session ${jobId} in ${APPLY_SESSIONS_DIR}`);
     process.exit(1);
   }
-  const report = diagnoseRun(session, { submitOutcome: submitOutcomeOf(session) });
+  // Detector #2 (semantic) — opt-in, makes a real claude -p call. Without it
+  // the report uses DOM read-back + submit only (mechanical detectors).
+  let semanticFlags = [];
+  if (withReview) {
+    try {
+      semanticFlags = await reviewFilledAnswers(session);
+    } catch (e) {
+      console.error(`(semantic review skipped: ${e?.message ?? e})`);
+    }
+  }
+  const report = diagnoseRun(session, { submitOutcome: submitOutcomeOf(session), semanticFlags });
 
   if (asJson) {
     console.log(JSON.stringify({ jobId, site: session.site_adapter, ...report }, null, 2));
@@ -109,4 +121,7 @@ function main() {
   console.log('');
 }
 
-main();
+main().catch((e) => {
+  console.error(e?.message ?? e);
+  process.exit(1);
+});
