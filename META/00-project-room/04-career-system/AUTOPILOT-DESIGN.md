@@ -252,6 +252,22 @@ RUN (find→…→submit) → run-report
 → re-RUN; autonomy% climbs; repeat until 100% (goal)
 ```
 
+### How it KNOWS there's a problem — 3 detectors (not "wait for a crash")
+
+After filling, the system checks its own work. `autonomy% = verified / required`
+is the aggregate signal (66% means 34% of fields are problems).
+
+1. **DOM read-back (mechanical)** — read each field's value back, compare to
+   intent → `verify_status`: verified / mismatch / fill_error / not_seen /
+   unverifiable. Catches "didn't fill / filled crooked / never saw the field".
+2. **LLM draft review (semantic)** — ⚠️ the critical one. Read-back only proves
+   *filled == intended*. G1 (sponsorship) **intended "No" and filled "No" →
+   verify_status = verified ✅**, but the answer was *wrong*. Read-back is blind
+   to "confidently wrong." So a `claude -p` reviewer reads {question + filled
+   answer + profile} and flags semantic mismatches ("F-1 OPT → should be Yes").
+   This is the step that turns "Victor noticed it" into an automatic check.
+3. **Screenshot + vision (submit)** — did submit actually land? (§10)
+
 ### ② DIAGNOSE — symptom → root cause → fixer (the failure taxonomy)
 
 | Symptom (in run-report) | Root cause | Fixer lane | Real example |
@@ -314,6 +330,22 @@ read-back. The split:
 So screenshots play **three roles**: (1) **record** (evidence + audit),
 (2) **verify the submit** via vision (the one verification DOM does worst — and
 the thing your goal hinges on), (3) **diagnosis fuel** for the AI fix agent.
-Don't vision-check every field (slow/expensive/less precise than DOM); reserve
-vision for the submit-confirmation and the DOM-ambiguous cases. Vision runs via
-Claude image input (SDK image block, or `claude -p` with the screenshot path).
+
+**Precise: exactly 4 places screenshots are used, and where they are NOT.**
+
+| Used at | Checks | Why not DOM |
+|---|---|---|
+| **after submit** ⭐ | "confirmation / thank-you page?" | DOM weakest here (G3: URL/selectors miss); the goal hinges on this |
+| **DIAGNOSE/FIX** | visual evidence for the fix agent (overlay/modal/render) | HTML can't show visual state |
+| **field `unverifiable`** | "does this widget visually show X?" | DOM can't read custom controls back |
+| **every step (record)** | nothing — pure audit/replay trail | — |
+
+| NOT used for | Uses instead | Why |
+|---|---|---|
+| finding/classifying fields | AXTree a11y snapshot | cheaper, deterministic; vision misreads |
+| per-field value verify | DOM read-back | per-field vision = slow/costly/less precise |
+| form-error detection on submit | DOM (aria-invalid), screenshot as backup | — |
+
+Principle: **a11y tree + DOM do the main work; screenshots+vision are a targeted
+fallback for the few things they can't — chiefly "did submit succeed."** Vision
+runs via Claude image input (SDK image block, or `claude -p` with the path).
