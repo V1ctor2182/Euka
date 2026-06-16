@@ -103,6 +103,21 @@ export async function lookupLegalValue(lookupKey, eeoDefault) {
       : { found: false, value: null };
   }
   const legal = await loadLegal();
+
+  // Synthetic key: "now OR in the future require sponsorship?" — the dominant
+  // US-application phrasing. Answer Yes if sponsorship is needed now OR in the
+  // future. Reading requires_sponsorship_now alone (the old mapping) made an
+  // F-1 OPT applicant — who needs H1B later — falsely answer "No", which is a
+  // misrepresentation. Polarity is asymmetric: a false "No" is harmful; a
+  // conservative "Yes" is honest, so this is the safe default for the generic
+  // sponsorship question too.
+  if (lookupKey === 'work_authorization.requires_sponsorship_ever') {
+    const wa = legal.work_authorization || {};
+    const ever =
+      Boolean(wa.requires_sponsorship_now) || Boolean(wa.requires_sponsorship_future);
+    return { found: true, value: ever ? 'Yes' : 'No', coercedFrom: 'boolean' };
+  }
+
   const raw = resolveDotPath(legal, lookupKey);
   if (raw == null) {
     return eeoDefault
