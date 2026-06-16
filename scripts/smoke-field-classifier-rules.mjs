@@ -484,4 +484,29 @@ await test('Greenhouse-shaped 15-field fixture: m1 hits Hard+Legal+File classes'
   );
 });
 
+// G1 (2026-06-11 P0 run): "now OR in the future require sponsorship?" must
+// answer Yes when sponsorship is needed now OR future. Pre-fix it read
+// requires_sponsorship_now alone, so an F-1 OPT applicant falsely answered No.
+await test('G1: sponsorship "now or future" → requires_sponsorship_ever (now||future)', async () => {
+  const { LEGAL_PATTERNS } = await import('../src/career/applier/classifier/regexRules.mjs');
+  const { loadLegal, _resetCache } = await import(
+    '../src/career/applier/classifier/legalLookup.mjs'
+  );
+  // Routing: the canonical phrasing hits the sponsorship rule → _ever key.
+  const q = 'Will you now or in the future require sponsorship for employment visa status?';
+  const rule = LEGAL_PATTERNS.find((r) => r.regex.test(q));
+  assert.equal(
+    rule?.lookupKey,
+    'work_authorization.requires_sponsorship_ever',
+    'sponsorship question must map to the requires_sponsorship_ever key',
+  );
+  // Logic: ever = now || future, computed from the loaded legal.yml.
+  _resetCache();
+  const wa = (await loadLegal()).work_authorization || {};
+  const expected =
+    Boolean(wa.requires_sponsorship_now) || Boolean(wa.requires_sponsorship_future) ? 'Yes' : 'No';
+  const got = await lookupLegalValue('work_authorization.requires_sponsorship_ever');
+  assert.equal(got.value, expected, `ever should equal now||future (${expected})`);
+});
+
 console.log(`\n✅ All ${passed} smoke tests passed.`);

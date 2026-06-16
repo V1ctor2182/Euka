@@ -613,15 +613,22 @@ export async function startMachine(body, deps = {}) {
         const detailRaw = wasCancelled
           ? (ctrl.lastEscalationReason?.detail || 'user cancelled')
           : (result.escalation_reason?.detail || 'submit-loop escalated');
-        // Map code → flywheel error_kind enum. Unknown codes fall back
-        // to 'escalated_unknown' so the Zod write doesn't reject silently.
-        const KNOWN_CODES = new Set([
-          'parse_failure', 'parse_failure_empty', 'all_strategies_failed',
-          'same_error', 'max_submits', 'timeout', 'submit_failed',
-          'unexpected_next_step', 'user_cancel', 'wait_loop_stuck', 'hard_cap',
-        ]);
-        const kind = `escalated_${KNOWN_CODES.has(codeRaw) ? codeRaw : 'unknown'}`;
-        _fireSiteFailure(jobId, ctrl, { message: detailRaw, kind });
+        // A-fix (2026-06-12): 'ready_for_submit' is the designed Human-Gate
+        // end state — the form filled cleanly and we handed off for the
+        // operator to submit. It is NOT a failure; recording it would
+        // pollute the site-failure flywheel with a phantom failure on every
+        // successful apply.
+        if (codeRaw !== 'ready_for_submit') {
+          // Map code → flywheel error_kind enum. Unknown codes fall back
+          // to 'escalated_unknown' so the Zod write doesn't reject silently.
+          const KNOWN_CODES = new Set([
+            'parse_failure', 'parse_failure_empty', 'all_strategies_failed',
+            'same_error', 'max_submits', 'timeout', 'submit_failed',
+            'unexpected_next_step', 'user_cancel', 'wait_loop_stuck', 'hard_cap',
+          ]);
+          const kind = `escalated_${KNOWN_CODES.has(codeRaw) ? codeRaw : 'unknown'}`;
+          _fireSiteFailure(jobId, ctrl, { message: detailRaw, kind });
+        }
       }
     } catch (err) {
       ctrl.lastOutcome = OUTCOME.ERROR;

@@ -746,14 +746,13 @@ await test('m7 cancel: double-cancel after machine sets ESCALATED → 409', asyn
   await deleteSession(jobId);
 });
 
-await test('m7 approveStep: session escalated → 403', async () => {
-  // We need an in-memory ctrl with lastOutcome=ESCALATED. Easiest is
-  // to inject directly via _peek: not available. So we drive through
-  // the runMachine path with an _isOnSubmitStep mock + a _submitForm
-  // mock that causes ESCALATED, then verify approveStep returns 403.
+await test('m7 approveStep: session escalated (ready_for_submit handoff) → 403', async () => {
+  // A-fix (2026-06-12): the IRON RULE is never auto-submit. On a single-page
+  // form the machine fills, then ESCALATES with reason 'ready_for_submit'
+  // (hand off to operator to click Submit) — it no longer runs the
+  // submit-first loop. This drives that path and verifies approveStep
+  // refuses with 403 once the session is in the escalated handoff state.
   const jobId = 'cccccccc1005';
-  // Start machine that immediately hits the submit-loop and escalates
-  // (via all-strategies-failed since fixField returns failure).
   const deps = {
     _getPage: async () => ({}),
     _readSession: async () => null,
@@ -784,12 +783,12 @@ await test('m7 approveStep: session escalated → 403', async () => {
   }
   const ctrl = _peek(jobId);
   assert.equal(ctrl.lastOutcome, OUTCOME.ESCALATED);
-  assert.equal(ctrl.lastEscalationReason.code, 'all_strategies_failed');
+  assert.equal(ctrl.lastEscalationReason.code, 'ready_for_submit');
   // approveStep must refuse
   const approveRes = approveStep(jobId, { approved: true });
   assert.equal(approveRes.status, 403);
   assert.match(approveRes.error, /escalated.*control transferred/);
-  assert.equal(approveRes.escalation_reason.code, 'all_strategies_failed');
+  assert.equal(approveRes.escalation_reason.code, 'ready_for_submit');
   _resetAll();
   await deleteSession(jobId);
 });
@@ -853,8 +852,11 @@ await test('m7 cancel: in-flight machine escalates ctrl + 2nd cancel → 409', a
   await deleteSession(jobId);
 });
 
-await test('m7 getStatus: surfaces escalation_reason + submitAttemptsRun for escalated session', async () => {
-  // Run a session through escalation, then check getStatus
+await test('m7 getStatus: surfaces ready_for_submit handoff escalation_reason (no submit attempts)', async () => {
+  // A-fix (2026-06-12): single-page form fills then hands off with
+  // 'ready_for_submit' — the machine runs ZERO submit attempts (iron rule:
+  // never auto-submit). getStatus must surface the handoff reason and a
+  // submitAttemptsRun of 0.
   const jobId = 'cccccccc1007';
   const deps = {
     _getPage: async () => ({}),
@@ -882,11 +884,12 @@ await test('m7 getStatus: surfaces escalation_reason + submitAttemptsRun for esc
   const status = await getStatus(jobId);
   assert.equal(status.status, 200);
   assert.equal(status.machine.lastOutcome, OUTCOME.ESCALATED);
-  assert.equal(status.machine.escalationReason.code, 'all_strategies_failed');
-  assert.ok(typeof status.machine.submitAttemptsRun === 'number');
-  assert.ok(status.machine.submitAttemptsRun >= 1);
-  // session.submit_attempts is also part of the session block via redactSession
+  assert.equal(status.machine.escalationReason.code, 'ready_for_submit');
+  // Iron rule: the handoff path attempts ZERO submits — submitAttemptsRun is
+  // unset (the submit-loop telemetry never ran) and submit_attempts is empty.
+  assert.ok(!status.machine.submitAttemptsRun, 'no submit attempts run on handoff');
   assert.ok(Array.isArray(status.session.submit_attempts));
+  assert.equal(status.session.submit_attempts.length, 0, 'no submit attempts recorded');
   _resetAll();
   await deleteSession(jobId);
 });
