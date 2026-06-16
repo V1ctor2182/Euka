@@ -17,10 +17,25 @@ The whole system is built around **one deliberate boundary**, and you set it:
 | **1-touch (default, safe)** | find → evaluate → tailor → **fill the entire form to the Submit button** | you click **Submit** (1 action) |
 | **0-touch (opt-in, per-ATS, after proof)** | everything incl. submit | none |
 
-You just re-affirmed "never auto-submit". So Autopilot ships at **1-touch**, and
-0-touch is a **per-ATS privilege that must be earned** (see §7 trust ladder) —
-never a default. The north star "fully apply by itself" = **reach 1-touch
-reliably, then graduate specific ATSs to 0-touch when *you* trust them.**
+0-touch is a **per-ATS privilege that must be earned** (see §7 trust ladder).
+
+### Recorded decision (2026-06-16, owner)
+
+> **Goal milestone:** get the full chain **find → … → submit** to succeed
+> **once, end-to-end**, on a **real company posting using a throwaway/fake
+> identity**. One successful auto-submit = milestone reached.
+
+Owner chose this over a sandbox / own-ATS-posting / fill-only target, after
+those alternatives were laid out. Rationale (owner's): only need a single proof
+the chain submits; won't re-apply to the same posting; most submits fail anyway.
+
+Noted trade-offs (do not block, owner accepts): a fake submission to a real ATS
+occupies one recruiter review and leaves the throwaway identity/IP on that ATS;
+iterating to the first success may take several attempts (= several junk
+submissions, not one). Mitigations to apply: use a **throwaway identity (not the
+real cyzhangv@umich.edu / real name)**, debug the *fill* fully before any real
+submit attempt (so the submit run is as close to one-shot as possible), and
+prefer a small/low-traffic posting.
 
 ---
 
@@ -215,3 +230,90 @@ Autonomy Rate up, Human-Touch down.
 _Start at **M1** (the harness + scorecard) — it's small, it makes everything
 after it measurable, and it turns "run a P0 by hand" into "run Autopilot and
 read the number." Everything else is "make the number go up."_
+
+---
+
+## 9. The self-fix engine — how the loop diagnoses + fixes itself
+
+Six stages per cycle. The intelligence is in ② DIAGNOSE (symptom→root cause)
+and ④ FIX (code lane); the safety + convergence is in ⑤ VERIFY.
+
+```
+RUN (find→…→submit) → run-report
+  ① OBSERVE   structured trace per field/step: label, ref, predicted class,
+              value, verify_status, control type, submit outcome + the
+              captured evidence (page HTML + screenshot)
+  ② DIAGNOSE  classify each gap from SYMPTOM → ROOT CAUSE
+  ③ ROUTE     root cause → fixer lane
+  ④ FIX       data lane: write YAML/rule | code lane: AI fix agent → diff+test
+  ⑤ VERIFY    objective judge: tests pass + replay autonomy↑ + no regression
+  ⑥ LEARN     apply (data hot-reload / code → training branch) + add the
+              failing case to the replay corpus (permanent regression guard)
+→ re-RUN; autonomy% climbs; repeat until 100% (goal)
+```
+
+### ② DIAGNOSE — symptom → root cause → fixer (the failure taxonomy)
+
+| Symptom (in run-report) | Root cause | Fixer lane | Real example |
+|---|---|---|---|
+| filled but value wrong | logic/mapping bug | 🟣 code | G1 sponsorship = No |
+| on page but not in snapshot (not_seen) | perception gap | 🟣 code (snapshot) | G2 education block |
+| seen but no class/value | knowledge gap | 🟢 data (legal/qa-bank) | unseen question |
+| submit clicked, errors not detected | detection gap | 🟣 code (submitFlow) | G3 90s timeout |
+| control unknown → manual | capability gap | 🟣 code (new strategy) | odd date picker |
+| wrong class assigned | classification gap | 🟢 data (learned rules) | label→class |
+
+Diagnosis is two-tier: **(a) deterministic rules** for known symptoms
+(`not_seen → perception`, `mismatch w/ ground truth → logic bug`), **(b) an LLM
+diagnostician** (`claude -p` reads trace + evidence HTML) for novel/ambiguous
+cases → returns root cause + which file to fix.
+
+### ④ FIX (code lane) — the AI fix agent = automating the manual debug loop
+
+```
+gap + evidence (real page HTML/screenshot) + the relevant module
+   → claude -p runs in-repo → code diff + a REVIEW-named regression test → run it
+```
+Runs off the local `claude -p` backend (no API key). This is literally the
+G1/G3 manual fixes, turned into a sub-agent the loop invokes.
+
+### ⑤ VERIFY — the objective judge (makes auto-merge safe + the loop converge)
+
+A fix is accepted only if ALL hold (this is "评判 OK 就 merge", and the judge is
+data, not vibes):
+1. the new regression test passes
+2. the full existing suite still passes (no regression)
+3. replaying the original failing case → that gap is now closed (autonomy↑)
+4. no other replayed case regresses
+
+Pass → auto-merge to a **`training` branch** + add the case to the replay
+corpus. Fail → discard + escalate ("couldn't auto-fix, here's why"). The one
+human gate retained: a **periodic batch audit before `training → main`** (the
+self-modifying-agent backstop — catches metric-gaming / subtle bugs).
+
+**Why it converges, not thrashes:** monotonic (a fix is kept only if autonomy↑ &
+no regression), convergent (gaps are finite per ATS; closed gaps stay closed via
+the corpus), anti-gaming (the metric is "verified correct vs ground truth" +
+human audit backstop).
+
+---
+
+## 10. Screenshots: record AND verify (esp. submit confirmation)
+
+Yes — and you already have capture (`runtime/screenshot.mjs`, per-step JPEGs).
+Use them as a **second verification channel**, not a replacement for DOM
+read-back. The split:
+
+| What to verify | Channel | Why |
+|---|---|---|
+| per-field value correct | **DOM read-back** (existing `verify_status`) | precise, cheap, deterministic — keep it |
+| **submit succeeded / confirmation page** | **screenshot + Claude vision** | robust where DOM detection is fragile — this is exactly the G3 failure (URL/selector signals missed). "Does this screenshot show a 'thank you / received'?" is hard to fool |
+| ambiguous field (`unverifiable`) | screenshot + vision cross-check | catches custom widgets that render value invisibly to the DOM, overlays, toasts |
+| every run (evidence/audit/diagnosis) | screenshot (record) | fuels ② DIAGNOSE (the fix agent reads it) + the human audit trail |
+
+So screenshots play **three roles**: (1) **record** (evidence + audit),
+(2) **verify the submit** via vision (the one verification DOM does worst — and
+the thing your goal hinges on), (3) **diagnosis fuel** for the AI fix agent.
+Don't vision-check every field (slow/expensive/less precise than DOM); reserve
+vision for the submit-confirmation and the DOM-ambiguous cases. Vision runs via
+Claude image input (SDK image block, or `claude -p` with the screenshot path).
