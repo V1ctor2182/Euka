@@ -166,7 +166,7 @@ milestones:
       验收: smoke 全绿;GET /feed 返回真实活动 + 4 漏斗数字;ROOM COMPLETE。
 
 commits:
-  - hash: "TBD"
+  - hash: "7bbcdc6"
     date: "2026-06-22"
     message: "[04-career-system/10-autopilot-engine] m1: apply-orchestrator master-tick + lifecycle + ON/OFF endpoints (smoke 23/23)"
     milestones_affected:
