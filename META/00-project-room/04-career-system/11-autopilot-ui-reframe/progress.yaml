@@ -1,0 +1,155 @@
+milestones:
+  - id: "m1-global-control-bar-and-dashboard"
+    name: "全局 Autopilot 控制条 + Dashboard 控制台(状态卡 + 4 漏斗 + 活动流)"
+    status: pending
+    estimated_files:
+      - "src/CareerApp.tsx"
+      - "src/career/CareerNav.tsx"
+      - "src/career/Dashboard.tsx"
+      - "src/career/dashboard.css"
+      - "scripts/smoke-dashboard-page.mjs"
+    estimated_lines: 320
+    depends_on: []
+    complexity_flags: ["design_decisions"]
+    open_questions: []
+    description: |
+      新建 Dashboard 落地页 + 顶栏全局 Autopilot 开关。消费 10-autopilot-engine
+      的 /status /enable /disable /feed。布局见 UI-LAYOUT §3.1 + §2。
+
+      Files:
+        - src/CareerApp.tsx(改):
+          · 顶栏右侧加 AutopilotToggle:读 GET /autopilot/status 显示 ON/OFF +
+            "扫描 N 源 · 上次 Xh 前";点击 POST /enable|/disable;乐观更新 + 失败回滚
+          · 路由 / → /career/dashboard;新增 <Route path="dashboard">
+          · RootRedirect 默认指向 dashboard
+        - src/career/Dashboard.tsx (~220 行):
+          · 顶部状态卡:大 ON/OFF + 运行摘要 + [暂停][调参(→Profile)]
+          · 4 漏斗数字卡:候选 / 填表中 / 待批准(高亮,→Review)/ 已提交;
+            数字来自 GET /autopilot/feed 的 funnel
+          · 实时活动流:feed.events 倒序,每条 [去处理]/[查看] 跳对应页
+          · 30s 轮询(对齐现有 Overview/Applied cadence)+ AbortController
+          · loading/error 骨架
+        - src/career/dashboard.css (~80 行,db- 前缀)
+        - scripts/smoke-dashboard-page.mjs (~50 行):
+          · /autopilot/status + /feed 返回 Dashboard 渲染所需形态
+          · enable/disable 翻转后 status.enabled 变化
+          · funnel 4 数字 + feed events 渲染;vite build 干净
+
+      验收: smoke 全绿;手动:顶栏开关切换 daemon、Dashboard 显示 4 数字 + 活动流。
+
+  - id: "m2-review-gate-queue"
+    name: "Review 人工闸门队列(待提交 / 待回答新问题 / 失败接管 + qa-bank 回写)"
+    status: pending
+    estimated_files:
+      - "src/career/Review.tsx"
+      - "src/career/review.css"
+      - "src/career/CareerNav.tsx"
+      - "scripts/smoke-review-queue.mjs"
+    estimated_lines: 380
+    depends_on: ["m1-global-control-bar-and-dashboard"]
+    complexity_flags: ["design_decisions"]
+    open_questions: []
+    description: |
+      产品灵魂页。收拢散在 Apply 流程里的人工动作成统一收件箱。布局见 UI-LAYOUT §3.2。
+      依赖 10-autopilot-engine m2(parked at submit gate 的会话)+ 现有 multistep
+      endpoint(escalation_reason)+ qa-bank。
+
+      Files:
+        - src/career/Review.tsx (~270 行):
+          · 三类卡片(filter chips: Submit / 问题 / 失败):
+            🟢 待提交:读 parked sessions(machine state=done/paused at gate)。
+               展示已填字段摘要 + [👀 预览整页][✅ 确认提交(→人工在浏览器点)][✕ 跳过]
+            🟡 待回答新问题:machine escalation 里的未答 question;textarea 回答 →
+               [💾 保存并继续] = POST 答案回 multistep machine + 回写 qa-bank
+               (history.jsonl,飞轮:下次自动填)
+            🔴 失败/需接管:escalation_reason=login/captcha → [手动接管→]
+          · 30s 轮询;空态/错误态
+        - src/career/review.css (~80 行,rv- 前缀;三态色 🟢🟡🔴)
+        - src/career/CareerNav.tsx(改):Review tab + 未读角标(待办计数,
+          来自 funnel.待批准 + 待回答)
+        - scripts/smoke-review-queue.mjs (~80 行):
+          · parked session 出现在待提交分组
+          · 回答新问题 → qa-bank history 增加一条 + machine 收到答案
+          · login-wall escalation → 失败分组
+          · 角标计数 = 待提交 + 待回答
+
+      验收: smoke 全绿;手动:一个 parked 申请在 Review 可预览;回答一个新问题后
+      qa-bank 多一条且 Review 该项消失。
+
+  - id: "m3-jobs-page-downgrade"
+    name: "Jobs 页降级(Sources→状态条、Filters→左栏、Apply→加入投递队列)"
+    status: pending
+    estimated_files:
+      - "src/career/find-jobs/FindJobs.tsx"
+      - "src/career/find-jobs/find-jobs.css"
+      - "src/career/find-jobs/JobCard.tsx"
+      - "scripts/smoke-jobs-downgrade.mjs"
+    estimated_lines: 220
+    depends_on: ["m1-global-control-bar-and-dashboard"]
+    complexity_flags: []
+    open_questions: []
+    description: |
+      重构现有 FindJobs(多为改写,非新建)。布局见 UI-LAYOUT §3.3。日常不再从这里
+      驱动,定位为透明度/干预页。
+
+      Files:
+        - src/career/find-jobs/FindJobs.tsx(改):
+          · ① Sources 从折叠区缩成顶部一行状态条 + [Scan now];Manage→Profile
+          · ② Filters 从手风琴移到左侧栏(桌面常驻,移动端抽屉);改一项右侧实时刷新
+          · 候选网格升为主体(右侧)
+        - src/career/find-jobs/JobCard.tsx(改):
+          · Apply 按钮语义改为「让机器投/加入队列」= POST 入编排器队列;
+            已入队显示「已排队」;登录墙 ATS 显示「需手动」
+        - find-jobs.css(改):两栏布局(左 filter rail + 右 grid)
+        - scripts/smoke-jobs-downgrade.mjs (~60 行):
+          · "加入队列"POST 到 autopilot 队列端点 → 候选进入 daemon 待投
+          · 已投/已排队 job 的按钮态正确
+          · 左栏改 filter → 右侧候选数变化(沿用现有 refilter)
+
+      验收: smoke 全绿;手动:左栏调筛选实时生效;点"让机器投"候选进入队列/Dashboard。
+
+  - id: "m4-nav-reframe-profile-reclass-room-complete"
+    name: "导航重排 + Profile 归类 + 删 legacy + ROOM COMPLETE"
+    status: pending
+    estimated_files:
+      - "src/career/CareerNav.tsx"
+      - "src/CareerApp.tsx"
+      - "src/career/settings/SettingsLayout.tsx"
+      - "scripts/smoke-nav-reframe.mjs"
+    estimated_lines: 180
+    depends_on:
+      - "m2-review-gate-queue"
+      - "m3-jobs-page-downgrade"
+    complexity_flags: []
+    open_questions: []
+    description: |
+      收口。主导航重排成 autopilot 闭环;Profile 重新归类;清理 legacy。布局见
+      UI-LAYOUT §2 + §3.5 + §4 归位表。
+
+      Files:
+        - src/career/CareerNav.tsx(改):
+          · 主 tab: Dashboard / Review③ / Jobs / Tracker / Profile
+          · 删除 Overview/Pipeline/Shortlist (legacy) 入口
+          · Learning/Iteration (debug) 收进 Profile → Dev/Debug(或 ?debug 才显示)
+          · Interview Prep 升为可见(并进 Tracker 或独立)
+        - src/CareerApp.tsx(改):路由对齐(legacy 路由 → redirect 到新页,不 404);
+          LAST_TAB / VALID_TABS 更新
+        - src/career/settings/SettingsLayout.tsx(改):
+          · 分组「机器怎么找」(Sources/Filters)+「机器怎么填」(Q&A/Narrative/
+            Proof/Identity)+「Dev/Debug」(Learning/Iteration)
+        - scripts/smoke-nav-reframe.mjs (~40 行):
+          · 5 个主 tab 路由可达;legacy 路由 redirect 不 404
+          · Profile 三分组渲染;vite build 干净
+
+      ROOM COMPLETE work:
+        - room.yaml lifecycle 保持 active;spec.md 当前进度 → ROOM COMPLETE
+        - 04-career-system 进度推进
+
+      验收: smoke 全绿;手动:导航是 5 tab;legacy bookmark 不 404;Profile 分三组;
+      ROOM COMPLETE。
+
+current_sprint: "Autopilot UI Reframe (C 方案 UI)"
+blockers:
+  - "依赖 10-autopilot-engine 的端点(/status /enable /disable /feed /queue);10 未 ready 时可对 stub 开发,联调需 10 完成"
+status_note: "🚧 PLANNING — 4 milestones。把手动浏览式 UI 重构为自动化优先:Dashboard 控制台 + Review 闸门队列为主舞台,Jobs/Sources/Filters 降级。详见 ../UI-LAYOUT.md。"
+last_updated: "2026-06-21"

@@ -1,0 +1,178 @@
+milestones:
+  - id: "m1-orchestrator-tick-and-lifecycle"
+    name: "投递编排器 master-tick + daemon 生命周期 + ON/OFF 控制端点"
+    status: completed
+    actual_files:
+      - "src/career/autopilot/autopilotState.mjs (~135 行)"
+      - "src/career/autopilot/orchestrator.mjs (~290 行)"
+      - "server.mjs (+~110 行: import + bootstrap + SIGTERM + 4 端点 + preview helper)"
+      - "scripts/smoke-autopilot-orchestrator.mjs (~310 行, 23 tests)"
+      - ".gitignore (+1: data/career/autopilot-state.json)"
+    actual_lines: 535
+    review_findings:
+      - "[CRITICAL] daily_count lost-update: /enable kick races interval tick → cap exceeded ~2x + double-fill → fixed: single-flight _tickRunning guard in tickOnce"
+      - "[HIGH] day-rollover drift: empty ticks didn't persist daily_count_date → file carried yesterday's count → fixed: persist reset (count+date) on every tick incl. no-candidate path"
+      - "[MEDIUM] daily_cap not clamped high on file-edit path → fixed: coerce clamps to HARD_DAILY_CAP=50 (rule-2 last line of defense)"
+      - "[MEDIUM] score_threshold config max was 100 but Stage scale is 1–5 → fixed: clamp config + coerce to MAX_SCORE_THRESHOLD=5"
+      - "[MEDIUM] preview duplicated pipeline-read + dedup regex (desync risk vs 'shows exactly what fills') → fixed: export+reuse readPipelineJobs + appliedJobIdSet"
+      - "[LOW] jobIdOfApplication returned raw id on non-match (weakened dedup) → fixed: return null"
+      - "[LOW] patchState failure silently swallowed → fixed: persistPatch warns"
+      - "[LOW] score_threshold could go negative on file edit → fixed: coerce floors at 0"
+      - "[DEFERRED→m2] cross-tick read-your-writes dedup (fill is no-op in m1; code comment left for m2 fillDriver)"
+      - "[KEPT] /enable kicks an immediate tick — intended UX (toggle = go); race now safe via single-flight guard. threshold default 0 is the owner's locked decision."
+    estimated_files:
+      - "src/career/autopilot/orchestrator.mjs"
+      - "src/career/autopilot/autopilotState.mjs"
+      - "server.mjs"
+      - "scripts/smoke-autopilot-orchestrator.mjs"
+    estimated_lines: 300
+    depends_on: []
+    complexity_flags: ["design_decisions", "error_handling_heavy", "concurrency"]
+    open_questions: []
+    description: |
+      照 src/career/finder/scheduler.mjs 的 master-tick 模式新建投递编排器骨架。
+      本 milestone 只做"挑候选 + 生命周期 + 控制端点",真正的 fill 驱动留给 m2
+      (m1 的 tick 先把选中的候选 log 出来 / 入一个内存队列,不真填)。
+
+      Files:
+        - src/career/autopilot/autopilotState.mjs (~80 行):
+          · 持久化 data/career/autopilot-state.json:
+            { enabled, last_tick_at, daily_count, daily_count_date,
+              daily_cap, score_threshold }
+          · read/write + 原子写(抄 cadenceState.mjs 的 randomUUID tmp 写法)
+          · resetDailyCountIfNewDay():跨天清零 daily_count
+          · DI seam(_readState/_writeState/_now)便于 smoke
+
+        - src/career/autopilot/orchestrator.mjs (~150 行):
+          · startAutopilot()/stopAutopilot():idempotent,抄 scheduler.mjs 的
+            module-level _intervalHandle + unref() 模式
+          · master tick(默认 60s):
+            1. resetDailyCountIfNewDay
+            2. enabled=false → skip
+            3. daily_count >= daily_cap → skip(log "daily cap reached")
+            4. isPipelineBusy()(scan/enrich 在跑)→ skip 本轮
+            5. selectCandidates():读 pipeline.json,过滤:
+               - 过了硬筛选(已是 pipeline 的 passed 集)
+               - Stage 分 >= score_threshold
+               - ATS ∈ {greenhouse, ashby, lever}(锁定决策 #3)
+               - 不在 applications store(锁定决策 #5,永不重复)
+               - 取 top-(daily_cap - daily_count) 个,按分降序
+            6. (m1)只 log 选中清单;(m2 接管真 fill)
+          · NEVER throws on tick:per-candidate 错误 warn + continue
+          · DI seam(_readPipeline/_readApplications/_now/_fill)
+
+        - server.mjs:
+          · bootstrap:DISABLE_AUTOPILOT_ENGINE === '1' 门控(对齐
+            DISABLE_SCAN_SCHEDULER);autopilot-state.enabled 决定是否真 tick
+          · SIGTERM teardown:stopAutopilot()
+          · 端点:
+            - GET  /api/career/autopilot/status  → { enabled, last_tick_at,
+              daily_count, daily_cap, score_threshold, next_candidates? }
+            - POST /api/career/autopilot/enable   → enabled=true + 立即 tick 一次
+            - POST /api/career/autopilot/disable  → enabled=false(在跑的 fill
+              不强杀,等它自然停在 gate)
+            - PUT  /api/career/autopilot/config    → { daily_cap?, score_threshold? }
+
+        - scripts/smoke-autopilot-orchestrator.mjs (~80 行, DI-driven,不起真 interval):
+          · enable→disable 翻转 state 文件
+          · daily cap:daily_count=cap 时 tick selectCandidates 返回 []
+          · 跨天:daily_count_date 是昨天 → 自动清零
+          · selectCandidates 只挑 3 家 ATS + 分≥阈值 + 排除已投 + top-N
+          · config PUT 改 daily_cap/threshold 持久化
+
+      验收: smoke 全绿;手动 enable 后 GET status 能看到 next_candidates 清单
+      (此时不真填,只列出 daemon 会投谁)。
+
+  - id: "m2-per-candidate-fill-driver"
+    name: "单候选填表驱动(server 内编排 multistep machine,停在 submit gate)"
+    status: pending
+    estimated_files:
+      - "src/career/autopilot/fillDriver.mjs"
+      - "src/career/autopilot/orchestrator.mjs"
+      - "scripts/smoke-autopilot-fill-driver.mjs"
+    estimated_lines: 280
+    depends_on: ["m1-orchestrator-tick-and-lifecycle"]
+    complexity_flags: ["error_handling_heavy", "concurrency"]
+    open_questions: []
+    description: |
+      把 scripts/autopilot-run.mjs 的"start→poll→auto-approve→settle at submit
+      gate"逻辑搬进 server 内的 fillDriver,接到 m1 的 tick 上,真正自动填表。
+
+      Files:
+        - src/career/autopilot/fillDriver.mjs (~180 行):
+          · driveOne(jobId, jobUrl):内部调 multistep machine 的 start +
+            autoApproveWhenSafe(复用现有 endpoint/machine,不复制 Playwright 逻辑)
+          · 轮询到 machine state=done(settled at submit gate)或 escalated
+          · 并发上限(MAX_CONCURRENT,默认 1 — 一次只填一个,避免抢浏览器)
+          · 登录墙 ATS / escalation(CAPTCHA/login)→ 不算失败,标记
+            outcome=needs_human,写进 Review 队列数据(application timeline 事件)
+          · 硬超时(抄 autopilot-run.mjs 的 MAX_POLLS),超时→outcome=timeout
+          · 永不调 submit(铁律)
+
+        - src/career/autopilot/orchestrator.mjs(改):
+          · tick 第 6 步从"只 log"改为:对每个选中候选 await fillDriver.driveOne
+          · 每成功处理一个 daily_count++,写回 state
+          · 每个候选结果记一条活动事件(给 m3 的 feed)
+
+        - scripts/smoke-autopilot-fill-driver.mjs (~100 行):
+          · driveOne 用 mock machine:done→记 parked 事件 + daily_count++
+          · escalated(login wall)→ needs_human 事件,不 ++(或按策略 ++,锁定:
+            登录墙跳过不计入 daily_count)
+          · 并发上限:同时来 3 个,最多 1 个在跑
+          · 永不 submit:断言驱动过程从不打 submit 动作
+
+      验收: smoke 全绿;enable daemon 后,一个真 Greenhouse 候选被自动填到 submit
+      gate 并出现在 applications/Review(手动验证一个真岗)。
+
+  - id: "m3-activity-feed-and-funnel-aggregation"
+    name: "活动流 feed + 4 漏斗数字聚合端点 + ROOM COMPLETE"
+    status: pending
+    estimated_files:
+      - "src/career/autopilot/feed.mjs"
+      - "server.mjs"
+      - "scripts/smoke-autopilot-feed.mjs"
+    estimated_lines: 160
+    depends_on: ["m2-per-candidate-fill-driver"]
+    complexity_flags: []
+    open_questions: []
+    description: |
+      给 Dashboard 提供单一聚合端点(UI room 的 11-m1 消费),收口本 room。
+
+      Files:
+        - src/career/autopilot/feed.mjs (~90 行):
+          · appendEvent(type, payload):append-only data/career/autopilot-feed.jsonl
+            (type ∈ scanned/queued/filling/parked/needs_human/failed)
+          · readRecentFeed(limit):最近 N 条,倒序
+          · computeFunnel():4 个数字 —
+            - 候选(pipeline passed 且符合选候标准)
+            - 填表中(machine state=running 的 sessions)
+            - 待批准(parked at submit gate 未提交的 applications)
+            - 已提交(applications status>=Applied,本周计数)
+
+        - server.mjs:
+          · GET /api/career/autopilot/feed?limit=N → { events[], funnel{} }
+          · 编排器 m2 的活动事件改为走 feed.appendEvent
+
+        - scripts/smoke-autopilot-feed.mjs (~50 行):
+          · appendEvent→readRecentFeed 倒序 + limit
+          · computeFunnel 用 fixture 三态数据 → 4 个数字正确
+          · GET /feed 返回 { events, funnel } 形态
+
+      ROOM COMPLETE work:
+        - room.yaml: lifecycle 已 active(保持)
+        - spec.md: 当前进度 → ROOM COMPLETE
+        - 04-career-system 进度推进
+
+      验收: smoke 全绿;GET /feed 返回真实活动 + 4 漏斗数字;ROOM COMPLETE。
+
+commits:
+  - hash: "TBD"
+    date: "2026-06-22"
+    message: "[04-career-system/10-autopilot-engine] m1: apply-orchestrator master-tick + lifecycle + ON/OFF endpoints (smoke 23/23)"
+    milestones_affected:
+      - "m1-orchestrator-tick-and-lifecycle (→ completed)"
+
+current_sprint: "Autopilot Engine (C 方案后端)"
+blockers: []
+status_note: "🚧 IN PROGRESS (1/3) — m1 done. autopilotState.mjs (persisted on/off + daily throttle, atomic write mirroring cadenceState) + orchestrator.mjs (master-tick mirroring scheduler.mjs: selectCandidates applies all 5 locked rules, single-flight guard, never-throws) + server.mjs bootstrap (DISABLE_AUTOPILOT_ENGINE gate) + SIGTERM teardown + 4 endpoints (/autopilot/status|enable|disable|config). m1's fill is a no-op; m2 wires fillDriver. Plan-agent review: 1 CRITICAL + 1 HIGH + 3 MEDIUM + 3 LOW all fixed (Codex CLI was binary-broken). 23/23 smoke + live endpoint test green. Next: m2 per-candidate fill driver."
+last_updated: "2026-06-22"

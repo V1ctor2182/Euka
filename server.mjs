@@ -54,6 +54,8 @@ import { previewHardFilter } from './src/career/finder/dryRun.mjs';
 import { enrichBatch } from './src/career/finder/jdEnrich.mjs';
 import { shouldEnrich } from './src/career/finder/atsByUrl.mjs';
 import { startScheduler, stopScheduler } from './src/career/finder/scheduler.mjs';
+import { startAutopilot, stopAutopilot, tickOnce as autopilotTickOnce, selectCandidates as autopilotSelectCandidates, readPipelineJobs as autopilotReadPipelineJobs, appliedJobIdSet as autopilotAppliedJobIdSet } from './src/career/autopilot/orchestrator.mjs';
+import { readAutopilotState, patchAutopilotState, withDailyReset, HARD_DAILY_CAP, MAX_SCORE_THRESHOLD } from './src/career/autopilot/autopilotState.mjs';
 import { MODEL_PRICING, computeCostUsd } from './src/career/lib/anthropicPricing.mjs';
 import { evaluateJobsStageA } from './src/career/evaluator/stageARunner.mjs';
 import { evaluateJobsStageB } from './src/career/evaluator/stageBRunner.mjs';
@@ -2548,6 +2550,16 @@ if (process.env.DISABLE_SCAN_SCHEDULER !== '1') {
   console.log('Scan scheduler enabled (master tick every 60s).');
 }
 
+// Autopilot apply orchestrator — every 60s, picks eligible candidates and
+// (m2) drives them to the submit gate. The interval is always registered; the
+// daemon only actually fills when autopilot-state.json::enabled is true (set
+// via POST /api/career/autopilot/enable). Gated by DISABLE_AUTOPILOT_ENGINE=1
+// for dev / tests, matching the scan scheduler's DISABLE_SCAN_SCHEDULER.
+if (process.env.DISABLE_AUTOPILOT_ENGINE !== '1') {
+  startAutopilot();
+  console.log('Autopilot engine enabled (master tick every 60s; fills only when enabled).');
+}
+
 // Clean shutdown: kill chromium subprocess on Ctrl+C / docker stop / nodemon
 // restart. Without this, Playwright leaves zombie browsers eating RAM.
 // Also stops the scan scheduler so no NEW ticks fire after this point.
@@ -2567,6 +2579,7 @@ async function gracefulShutdown(signal) {
   _shuttingDown = true;
   console.log(`Received ${signal}, shutting down chromium...`);
   stopScheduler();
+  stopAutopilot();
   await shutdownBrowser();
   process.exit(0);
 }
@@ -3593,6 +3606,101 @@ app.get('/api/career/finder/scheduler/status', async (_req, res) => {
       };
     });
     res.json({ rows, scan_status: getScanStatus() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Autopilot engine: status / enable / disable / config ──────────────
+// The apply-orchestrator daemon's control surface (10-autopilot-engine m1).
+// The Dashboard's global ON/OFF toggle (11-autopilot-ui-reframe m1) drives
+// these. next_candidates previews who the daemon would fill on its next tick
+// (same selection the tick uses), so the UI can show intent before enabling.
+
+// Preview the candidates the daemon would pick next, given current state.
+// Reads pipeline + applications directly (mirrors the tick's selection) so the
+// status endpoint reflects exactly what would be filled. Fail-soft: returns []
+// on any read error rather than 500-ing the whole status call.
+async function previewAutopilotCandidates(state) {
+  try {
+    const withReset = withDailyReset(state, Date.now());
+    const remaining = withReset.daily_cap - withReset.daily_count;
+    if (remaining <= 0) return [];
+    // Reuse the orchestrator's exact pipeline-read + dedup helpers so the
+    // preview can never desync from what the tick would actually select.
+    const jobs = await autopilotReadPipelineJobs();
+    const appliedJobIds = autopilotAppliedJobIdSet(await readApplications());
+    return autopilotSelectCandidates(jobs, {
+      threshold: withReset.score_threshold,
+      limit: remaining,
+      appliedJobIds,
+    });
+  } catch (e) {
+    console.warn('[autopilot] preview failed:', String(e?.message ?? e).slice(0, 200));
+    return [];
+  }
+}
+
+app.get('/api/career/autopilot/status', async (_req, res) => {
+  try {
+    const state = withDailyReset(await readAutopilotState(), Date.now());
+    const next_candidates = await previewAutopilotCandidates(state);
+    res.json({
+      enabled: state.enabled,
+      last_tick_at: state.last_tick_at,
+      daily_count: state.daily_count,
+      daily_cap: state.daily_cap,
+      score_threshold: state.score_threshold,
+      remaining_today: Math.max(0, state.daily_cap - state.daily_count),
+      next_candidates,
+      engine_disabled: process.env.DISABLE_AUTOPILOT_ENGINE === '1',
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/career/autopilot/enable', async (_req, res) => {
+  try {
+    const state = await patchAutopilotState({ enabled: true });
+    // Kick a tick immediately so the operator sees activity without waiting up
+    // to 60s for the next interval. Fire-and-forget — never blocks the response.
+    autopilotTickOnce({}).catch(() => {});
+    res.json({ enabled: state.enabled });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/career/autopilot/disable', async (_req, res) => {
+  try {
+    const state = await patchAutopilotState({ enabled: false });
+    res.json({ enabled: state.enabled });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// daily_cap bounded by the hard safety ceiling; score_threshold by the 1–5
+// Stage scale (0 = no gate). Mirrors the clamps in autopilotState.coerce so the
+// endpoint rejects out-of-range values instead of silently clamping them.
+const AutopilotConfigSchema = z
+  .object({
+    daily_cap: z.number().int().min(0).max(HARD_DAILY_CAP).optional(),
+    score_threshold: z.number().min(0).max(MAX_SCORE_THRESHOLD).optional(),
+  })
+  .refine((o) => o.daily_cap !== undefined || o.score_threshold !== undefined, {
+    message: 'provide at least one of daily_cap, score_threshold',
+  });
+
+app.put('/api/career/autopilot/config', async (req, res) => {
+  const parsed = AutopilotConfigSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'invalid config' });
+  }
+  try {
+    const state = await patchAutopilotState(parsed.data);
+    res.json({ daily_cap: state.daily_cap, score_threshold: state.score_threshold });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
