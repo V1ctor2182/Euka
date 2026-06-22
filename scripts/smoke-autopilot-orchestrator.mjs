@@ -23,10 +23,14 @@ import {
   atsOf,
   tickOnce as _tick,
   AUTO_ATS,
+  _resetRecentAttemptsForTesting,
 } from '../src/career/autopilot/orchestrator.mjs';
 
 let passed = 0;
 async function test(name, fn) {
+  // The orchestrator's recent-attempts cooldown is module-level state; reset it
+  // before each test so reused jobIds across tests aren't falsely in cooldown.
+  _resetRecentAttemptsForTesting();
   try {
     await fn();
     console.log('PASS:', name);
@@ -207,8 +211,14 @@ function tickDeps(overrides = {}) {
     _patchState: async (patch) => { state = { ...state, ...patch }; return state; },
     _readPipeline: async () => overrides.jobs ?? [],
     _readApplications: async () => overrides.apps ?? [],
+    _readActiveSessions: async () => overrides.sessions ?? [],
     _isPipelineBusy: () => overrides.busy ?? false,
-    _fill: async (cand) => { filled.push(cand); if (overrides.fillThrows) throw new Error('boom'); },
+    _fill: async (cand) => {
+      filled.push(cand);
+      if (overrides.fillThrows) throw new Error('boom');
+      // Default: a successful park (counts toward the daily cap).
+      return { outcome: overrides.fillOutcome ?? 'parked', jobId: cand.id, escalationCode: overrides.fillEscalationCode ?? null };
+    },
     _now: () => overrides.now ?? Date.now(),
   };
   return { deps, filled, getState: () => state };
@@ -222,6 +232,7 @@ function mergedFrom(t) {
     patchState: t.deps._patchState,
     readPipeline: t.deps._readPipeline,
     readApplications: t.deps._readApplications,
+    readActiveSessions: t.deps._readActiveSessions,
     isPipelineBusy: t.deps._isPipelineBusy,
     fill: t.deps._fill,
     now: t.deps._now,
@@ -287,7 +298,10 @@ await test('tick-7. fill throwing on one candidate does not abort the tick', asy
   const t = tickDeps({ jobs: [job('aaaaaaaaaaaa', { score: 5 })], fillThrows: true });
   const r = await _tick(mergedFrom(t));
   assert.equal(r.fired, true);
-  assert.equal(r.processed, 0); // fill threw → not counted, but tick survived
+  // A throw is defended as a FAILED attempt — counted (consumed a slot) but the
+  // tick survives and settles cleanly.
+  assert.equal(r.processed, 1);
+  assert.equal(r.outcomes[0].outcome, 'failed');
 });
 
 await test('tick-8. no candidates → stamps last_tick_at, no fill', async () => {
@@ -309,6 +323,63 @@ await test('tick-9. day rollover persists reset date + count on empty tick (H1)'
   // file no longer carries yesterday's 4.
   assert.equal(t.getState().daily_count, 0);
   assert.equal(t.getState().daily_count_date, dayKey());
+});
+
+await test('tick-9b. job with an existing apply-session is excluded (re-fill guard)', async () => {
+  const t = tickDeps({
+    jobs: [job('aaaaaaaaaaaa', { score: 5 }), job('bbbbbbbbbbbb', { score: 9 })],
+    sessions: ['bbbbbbbbbbbb'], // already parked / in-flight
+  });
+  const r = await _tick(mergedFrom(t));
+  assert.equal(r.processed, 1);
+  assert.deepEqual(t.filled.map((c) => c.id), ['aaaaaaaaaaaa']); // bbbb excluded
+});
+
+await test('tick-9c. login-wall needs_human does NOT consume a daily slot', async () => {
+  const t = tickDeps({ jobs: [job('aaaaaaaaaaaa', { score: 5 })], fillOutcome: 'needs_human', fillEscalationCode: 'login_wall' });
+  const r = await _tick(mergedFrom(t));
+  assert.equal(r.fired, true);
+  assert.equal(r.processed, 0); // login-wall not counted (locked decision)
+  assert.equal(t.getState().daily_count, 0);
+});
+
+await test('tick-9c2. non-login-wall needs_human DOES consume a slot', async () => {
+  // e.g. submit_failed / wait_loop_stuck — the form was engaged.
+  const t = tickDeps({ jobs: [job('aaaaaaaaaaaa', { score: 5 })], fillOutcome: 'needs_human', fillEscalationCode: 'submit_failed' });
+  const r = await _tick(mergedFrom(t));
+  assert.equal(r.processed, 1);
+  assert.equal(t.getState().daily_count, 1);
+});
+
+await test('tick-9e. a failed job is in cooldown next tick (no re-fill, C1)', async () => {
+  const t = tickDeps({ jobs: [job('aaaaaaaaaaaa', { score: 5 })], fillOutcome: 'failed' });
+  const merged = mergedFrom(t);
+  const r1 = await _tick(merged);
+  assert.equal(r1.processed, 1);
+  assert.equal(t.filled.length, 1);
+  // Second tick: same job, but now in cooldown → excluded → not re-filled.
+  const r2 = await _tick(merged);
+  assert.equal(r2.reason, 'no-candidates');
+  assert.equal(t.filled.length, 1); // still only the first attempt
+});
+
+await test('tick-9f. BUSY does not count and is NOT put in cooldown', async () => {
+  const t = tickDeps({ jobs: [job('aaaaaaaaaaaa', { score: 5 })], fillOutcome: 'busy' });
+  const merged = mergedFrom(t);
+  const r1 = await _tick(merged);
+  assert.equal(r1.processed, 0); // BUSY never counts
+  // Next tick may retry (BUSY = another driver owns it transiently).
+  const r2 = await _tick(merged);
+  assert.equal(t.filled.length, 2);
+});
+
+await test('tick-9d. sessions-read failure → skip tick (fail-closed)', async () => {
+  const t = tickDeps({ jobs: [job('aaaaaaaaaaaa', { score: 5 })] });
+  const merged = mergedFrom(t);
+  merged.readActiveSessions = async () => { throw new Error('dir gone'); };
+  const r = await _tick(merged);
+  assert.equal(r.reason, 'sessions-read-failed');
+  assert.equal(t.filled.length, 0);
 });
 
 await test('tick-10. single-flight guard: overlapping tick no-ops (C1/C2)', async () => {

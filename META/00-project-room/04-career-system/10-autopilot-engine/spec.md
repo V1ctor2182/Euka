@@ -29,10 +29,10 @@ daemon 会**拿真简历投真公司**,以下为不可翻转的安全边界:
 
 相关文档:[`../AUTOPILOT-DESIGN.md`](../AUTOPILOT-DESIGN.md)(/loop 开发循环的由来)、[`../UI-LAYOUT.md`](../UI-LAYOUT.md)(消费本 room 端点的 UI)。
 
-## 当前进度 — 🚧 IN PROGRESS (1/3)
+## 当前进度 — 🚧 IN PROGRESS (2/3)
 
-- ✅ **m1-orchestrator-tick-and-lifecycle** — `autopilotState.mjs`(持久化 on/off + 每日节流,原子写)+ `orchestrator.mjs`(master-tick 镜像 scheduler.mjs,`selectCandidates` 落实 5 条铁律 + single-flight 守卫 + never-throws)+ server.mjs bootstrap(`DISABLE_AUTOPILOT_ENGINE` 门控)+ SIGTERM teardown + 4 端点(`/api/career/autopilot/{status,enable,disable,config}`)。m1 的 fill 为 no-op,m2 接 fillDriver。Review:1C+1H+3M+3L 全修;23/23 smoke + 实测端点通过。
-- ⬜ m2-per-candidate-fill-driver
-- ⬜ m3-activity-feed-and-funnel-aggregation
+- ✅ **m1-orchestrator-tick-and-lifecycle** — `autopilotState.mjs`(持久化 on/off + 每日节流,原子写)+ `orchestrator.mjs`(master-tick 镜像 scheduler.mjs,`selectCandidates` 落实 5 条铁律 + single-flight 守卫 + never-throws)+ server.mjs bootstrap(`DISABLE_AUTOPILOT_ENGINE` 门控)+ SIGTERM teardown + 4 端点。Review:1C+1H+3M+3L 全修;23/23 smoke。
+- ✅ **m2-per-candidate-fill-driver** — `fillDriver.driveOne` 驱动现有 multistep machine(start + autoApproveWhenSafe)到 submit gate 即停,**永不 submit**(`ready_for_submit` escalation 就是成功态 → PARKED)。orchestrator.fill 换成 driveOne;dedup = applications + active apply-sessions + 6h 内存 cooldown(session-less 失败不再烧 cap);计数排除登录墙 + BUSY。Review:2C(ready_for_submit 误判、session-less 重填)+1H+2M+1L 全修;16+29 smoke + 实测启动通过。
+- ⬜ m3-activity-feed-and-funnel-aggregation + ROOM COMPLETE
 
 milestones 详见 `progress.yaml`。构建顺序先于 `11-autopilot-ui-reframe`(UI 消费本 room 的端点)。

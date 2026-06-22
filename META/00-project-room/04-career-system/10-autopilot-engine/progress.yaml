@@ -85,7 +85,22 @@ milestones:
 
   - id: "m2-per-candidate-fill-driver"
     name: "单候选填表驱动(server 内编排 multistep machine,停在 submit gate)"
-    status: pending
+    status: completed
+    actual_files:
+      - "src/career/autopilot/fillDriver.mjs (~180 行, driveOne)"
+      - "src/career/autopilot/orchestrator.mjs (改: fill=driveOne, session+cooldown dedup, escalation-code counting, tick never-throw)"
+      - "server.mjs (改: preview 也排除 active sessions)"
+      - "scripts/smoke-autopilot-fill-driver.mjs (~230 行, 16 tests)"
+      - "scripts/smoke-autopilot-orchestrator.mjs (改: +6 tests → 29)"
+    actual_lines: 470
+    review_findings:
+      - "[CRITICAL] '填到 submit gate' 的成功路径其实是 OUTCOME.ESCALATED + code='ready_for_submit'(IRON-RULE 永不自动 submit 的交接),不是 COMPLETED → 原 classifyTerminal 误判成 NEEDS_HUMAN → 修:按 escalationCode 分类,ready_for_submit→PARKED"
+      - "[CRITICAL] 填表若在写 session 文件前就挂(getPage throw)→ 无 session 文件 → 下轮重新选中 → 每天把 cap 烧在一个坏 job 上 → 修:内存 6h cooldown ledger 排除已尝试 job"
+      - "[HIGH] getStatus 返回 {status:404/500}(无 machine)被当成'继续轮询'→ 死 job 空转满 8 分钟 → 修:连续 missing-machine 达 6 次即 bail 到 FAILED"
+      - "[MEDIUM] 计数把所有 ESCALATED 当登录墙'不计数'→ submit-loop 等重度交互漏计 → 修:仅 login/captcha code 免计,其余计数"
+      - "[MEDIUM] escalationCode 被 orchestrator 丢弃 → 修:穿透到计数决策 + pending 分支也带上"
+      - "[LOW] tickOnce 注入 throwing dep 时可能抛出违反 never-throw → 修:tickOnce 包 try/catch 返回 'tick-threw'"
+      - "[NOTE] 3 家 ATS 无登录墙,LOGIN_WALL_CODES 为占位 — 为将来接登录墙 ATS 预留免计逻辑"
     estimated_files:
       - "src/career/autopilot/fillDriver.mjs"
       - "src/career/autopilot/orchestrator.mjs"
@@ -172,7 +187,13 @@ commits:
     milestones_affected:
       - "m1-orchestrator-tick-and-lifecycle (→ completed)"
 
+  - hash: "TBD2"
+    date: "2026-06-22"
+    message: "[04-career-system/10-autopilot-engine] m2: per-candidate fill driver (drives multistep machine to submit gate, never submits) (smoke 16+29)"
+    milestones_affected:
+      - "m2-per-candidate-fill-driver (→ completed)"
+
 current_sprint: "Autopilot Engine (C 方案后端)"
 blockers: []
-status_note: "🚧 IN PROGRESS (1/3) — m1 done. autopilotState.mjs (persisted on/off + daily throttle, atomic write mirroring cadenceState) + orchestrator.mjs (master-tick mirroring scheduler.mjs: selectCandidates applies all 5 locked rules, single-flight guard, never-throws) + server.mjs bootstrap (DISABLE_AUTOPILOT_ENGINE gate) + SIGTERM teardown + 4 endpoints (/autopilot/status|enable|disable|config). m1's fill is a no-op; m2 wires fillDriver. Plan-agent review: 1 CRITICAL + 1 HIGH + 3 MEDIUM + 3 LOW all fixed (Codex CLI was binary-broken). 23/23 smoke + live endpoint test green. Next: m2 per-candidate fill driver."
+status_note: "🚧 IN PROGRESS (2/3) — m1+m2 done. m2: fillDriver.driveOne drives the existing multistep machine (start + autoApproveWhenSafe) to the submit gate and stops — NEVER submits (the ready_for_submit escalation IS the success path → PARKED). orchestrator.fill is now driveOne; dedup excludes applications + active apply-sessions + a 6h in-memory cooldown (so a session-less failure can't burn the cap); daily_count counts every ATS-engaging outcome except login-wall + BUSY. Plan-agent review: 2 CRITICAL (ready_for_submit mis-route; session-less re-fill) + 1 HIGH (dead-session spin) + 2 MEDIUM + 1 LOW all fixed. 16/16 fill-driver + 29/29 orchestrator smoke + lint + live boot green. Next: m3 activity feed + funnel + ROOM COMPLETE.\n\n(m1 done. autopilotState.mjs (persisted on/off + daily throttle, atomic write mirroring cadenceState) + orchestrator.mjs (master-tick mirroring scheduler.mjs: selectCandidates applies all 5 locked rules, single-flight guard, never-throws) + server.mjs bootstrap (DISABLE_AUTOPILOT_ENGINE gate) + SIGTERM teardown + 4 endpoints (/autopilot/status|enable|disable|config). m1's fill is a no-op; m2 wires fillDriver. Plan-agent review: 1 CRITICAL + 1 HIGH + 3 MEDIUM + 3 LOW all fixed (Codex CLI was binary-broken). 23/23 smoke + live endpoint test green. Next: m2 per-candidate fill driver."
 last_updated: "2026-06-22"

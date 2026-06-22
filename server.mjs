@@ -54,7 +54,7 @@ import { previewHardFilter } from './src/career/finder/dryRun.mjs';
 import { enrichBatch } from './src/career/finder/jdEnrich.mjs';
 import { shouldEnrich } from './src/career/finder/atsByUrl.mjs';
 import { startScheduler, stopScheduler } from './src/career/finder/scheduler.mjs';
-import { startAutopilot, stopAutopilot, tickOnce as autopilotTickOnce, selectCandidates as autopilotSelectCandidates, readPipelineJobs as autopilotReadPipelineJobs, appliedJobIdSet as autopilotAppliedJobIdSet } from './src/career/autopilot/orchestrator.mjs';
+import { startAutopilot, stopAutopilot, tickOnce as autopilotTickOnce, selectCandidates as autopilotSelectCandidates, readPipelineJobs as autopilotReadPipelineJobs, appliedJobIdSet as autopilotAppliedJobIdSet, readActiveSessionJobIds as autopilotReadActiveSessionJobIds } from './src/career/autopilot/orchestrator.mjs';
 import { readAutopilotState, patchAutopilotState, withDailyReset, HARD_DAILY_CAP, MAX_SCORE_THRESHOLD } from './src/career/autopilot/autopilotState.mjs';
 import { MODEL_PRICING, computeCostUsd } from './src/career/lib/anthropicPricing.mjs';
 import { evaluateJobsStageA } from './src/career/evaluator/stageARunner.mjs';
@@ -3627,9 +3627,11 @@ async function previewAutopilotCandidates(state) {
     const remaining = withReset.daily_cap - withReset.daily_count;
     if (remaining <= 0) return [];
     // Reuse the orchestrator's exact pipeline-read + dedup helpers so the
-    // preview can never desync from what the tick would actually select.
+    // preview can never desync from what the tick would actually select —
+    // including the active-apply-session exclusion (parked candidates).
     const jobs = await autopilotReadPipelineJobs();
     const appliedJobIds = autopilotAppliedJobIdSet(await readApplications());
+    for (const id of await autopilotReadActiveSessionJobIds()) appliedJobIds.add(id);
     return autopilotSelectCandidates(jobs, {
       threshold: withReset.score_threshold,
       limit: remaining,

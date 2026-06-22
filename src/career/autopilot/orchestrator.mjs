@@ -17,9 +17,12 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { readdir } from 'node:fs/promises';
 import { detectAtsType } from '../finder/atsByUrl.mjs';
 import { isPipelineBusy, PIPELINE_FILE } from '../finder/scanRunner.mjs';
 import { readApplications } from '../applications/store.mjs';
+import { APPLY_SESSIONS_DIR, JOB_ID_RE as SESSION_JOB_ID_RE } from '../applier/multistep/applySessionsStore.mjs';
+import { driveOne, FILL_OUTCOME } from './fillDriver.mjs';
 import {
   readAutopilotState,
   patchAutopilotState,
@@ -109,17 +112,73 @@ export async function readPipelineJobs(file = PIPELINE_FILE) {
   }
 }
 
+// jobIds that already have an apply-session on disk. A parked-for-review or
+// in-flight candidate has a session but NO applications-store row yet, so
+// without this the tick would re-fill it every 60s (the m1-review H3 gap).
+export async function readActiveSessionJobIds(dir = APPLY_SESSIONS_DIR) {
+  if (!existsSync(dir)) return [];
+  try {
+    const files = await readdir(dir);
+    return files
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => f.replace(/\.json$/, ''))
+      .filter((id) => SESSION_JOB_ID_RE.test(id));
+  } catch (e) {
+    console.warn(`[autopilot] session-dir read failed, treating as empty: ${e.message}`);
+    return [];
+  }
+}
+
+// Escalation codes that mean "blocked by a login/CAPTCHA wall" — per the
+// owner's locked decision these do NOT consume a daily slot (we never got to
+// fill a real application). None of the 3 in-scope ATSs surface these today
+// (Workday/iCIMS are excluded by rule 3), but this keeps the door open for when
+// login-walled ATSs are added without re-counting.
+const LOGIN_WALL_CODES = new Set(['login_wall', 'captcha', 'login_required']);
+
+// Whether a driveOne result consumes a daily-cap slot. BUSY = no work happened.
+// A NEEDS_HUMAN caused by a login wall is slot-free (locked decision); every
+// other outcome engaged the ATS with a real fill attempt and counts.
+function isCountedAttempt(outcome, escalationCode) {
+  if (outcome === FILL_OUTCOME.BUSY) return false;
+  if (outcome === FILL_OUTCOME.NEEDS_HUMAN && LOGIN_WALL_CODES.has(escalationCode)) return false;
+  return true;
+}
+
+// In-memory cooldown of recently-attempted jobIds. A fill that FAILS before a
+// session file is ever written (e.g. getPage throws) would otherwise be
+// re-picked every tick and burn the whole daily cap on one broken job. This
+// excludes any job attempted within COOLDOWN_MS regardless of outcome. In-memory
+// is fine: a process restart re-attempting is acceptable (same posture as the
+// scan scheduler's in-memory state).
+const ATTEMPT_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h
+const _recentAttempts = new Map(); // jobId → epoch ms of last attempt
+
+function recordAttempt(jobId, nowMs) {
+  _recentAttempts.set(jobId, nowMs);
+}
+function inCooldown(jobId, nowMs) {
+  const at = _recentAttempts.get(jobId);
+  if (at == null) return false;
+  if (nowMs - at >= ATTEMPT_COOLDOWN_MS) {
+    _recentAttempts.delete(jobId); // expired — let it be retried
+    return false;
+  }
+  return true;
+}
+// Test helper.
+export function _resetRecentAttemptsForTesting() {
+  _recentAttempts.clear();
+}
+
 const DEFAULT_DEPS = {
   readState: readAutopilotState,
   patchState: patchAutopilotState,
   readPipeline: readPipelineJobs,
   readApplications,
+  readActiveSessions: readActiveSessionJobIds,
   isPipelineBusy,
-  // m1: no real fill. m2 injects fillDriver.driveOne here.
-  fill: async (cand) => {
-    console.log(`[autopilot] (m1 no-op) would fill ${cand.id} ${cand.company} — ${cand.role}`);
-    return { outcome: 'skipped-m1' };
-  },
+  fill: (cand) => driveOne(cand),
   now: () => Date.now(),
 };
 
@@ -129,6 +188,7 @@ function mergeDeps(opts) {
     patchState: opts._patchState ?? DEFAULT_DEPS.patchState,
     readPipeline: opts._readPipeline ?? DEFAULT_DEPS.readPipeline,
     readApplications: opts._readApplications ?? DEFAULT_DEPS.readApplications,
+    readActiveSessions: opts._readActiveSessions ?? DEFAULT_DEPS.readActiveSessions,
     isPipelineBusy: opts._isPipelineBusy ?? DEFAULT_DEPS.isPipelineBusy,
     fill: opts._fill ?? DEFAULT_DEPS.fill,
     now: opts._now ?? DEFAULT_DEPS.now,
@@ -164,6 +224,11 @@ export async function tickOnce(deps) {
   _tickRunning = true;
   try {
     return await runTick(deps);
+  } catch (e) {
+    // Belt-and-suspenders: runTick guards every fallible step, but an injected
+    // dep (e.g. a throwing now()) could still throw. tickOnce must NEVER throw.
+    console.warn('[autopilot] tick threw unexpectedly:', String(e?.message ?? e).slice(0, 200));
+    return { fired: false, reason: 'tick-threw' };
   } finally {
     _tickRunning = false;
   }
@@ -209,6 +274,23 @@ async function runTick(deps) {
     return { fired: false, reason: 'applications-read-failed' };
   }
 
+  // Also exclude jobs that already have an apply-session: a parked-for-review or
+  // in-flight candidate has a session but no applications-store row yet, so this
+  // is what stops the tick re-filling it every 60s. Fail-closed for the same
+  // reason as applications: if we can't list sessions, skip the tick.
+  try {
+    for (const id of await deps.readActiveSessions()) appliedJobIds.add(id);
+  } catch (e) {
+    console.warn('[autopilot] readActiveSessions failed, skipping tick:', String(e?.message ?? e).slice(0, 200));
+    return { fired: false, reason: 'sessions-read-failed' };
+  }
+
+  // And exclude jobs attempted within the cooldown — covers failures that never
+  // wrote a session file (so the two checks above wouldn't catch them).
+  for (const id of jobs) {
+    if (id?.id && inCooldown(id.id, now)) appliedJobIds.add(id.id);
+  }
+
   const picked = selectCandidates(jobs, {
     threshold: state.score_threshold,
     limit: remaining,
@@ -230,21 +312,31 @@ async function runTick(deps) {
     return { fired: false, reason: 'no-candidates' };
   }
 
-  // m1: pick + (no-op) fill. m2 replaces deps.fill with fillDriver.driveOne and
-  // each fill writes an application row. NOTE for m2: the applied-set above is
-  // read once per tick; the single-flight guard prevents overlapping ticks, but
-  // m2 must ensure each fill's application row lands BEFORE the next tick reads
-  // the store (read-your-writes), else a slow write could let the next tick
-  // re-select the same job. (Not an issue in m1 — fill is a no-op.)
+  // Drive each picked candidate through the fill machine to the submit gate.
+  // fillDriver.driveOne never throws and never submits; it returns an outcome
+  // describing what the daemon should do next. Re-fill of a parked candidate is
+  // prevented by the session-dedup above (driveOne's startMachine creates a
+  // session, so next tick excludes it). Counting policy: login-wall NEEDS_HUMAN
+  // doesn't consume a daily slot (owner's locked decision); see COUNTED_OUTCOMES.
   let processed = 0;
+  const outcomes = [];
   for (const cand of picked) {
+    let result;
     try {
-      await deps.fill(cand);
-      processed += 1;
+      result = await deps.fill(cand);
     } catch (e) {
-      // One bad candidate must not abort the tick (rule: NEVER throws on tick).
-      console.warn(`[autopilot] fill failed for ${cand.id}:`, String(e?.message ?? e).slice(0, 200));
+      // driveOne is contracted never to throw, but defend anyway (rule: NEVER
+      // throws on tick). Treat an unexpected throw as a failed attempt.
+      console.warn(`[autopilot] fill threw for ${cand.id}:`, String(e?.message ?? e).slice(0, 200));
+      result = { outcome: FILL_OUTCOME.FAILED, jobId: cand.id };
     }
+    const outcome = result?.outcome ?? FILL_OUTCOME.FAILED;
+    const escalationCode = result?.escalationCode ?? null;
+    outcomes.push({ id: cand.id, outcome, escalationCode });
+    // Record every non-BUSY attempt in the cooldown so a session-less failure
+    // can't be re-picked next tick. BUSY means another driver already owns it.
+    if (outcome !== FILL_OUTCOME.BUSY) recordAttempt(cand.id, now);
+    if (isCountedAttempt(outcome, escalationCode)) processed += 1;
   }
 
   await persistPatch(deps, {
@@ -253,7 +345,7 @@ async function runTick(deps) {
     daily_count_date: today,
   });
 
-  return { fired: true, picked, processed };
+  return { fired: true, picked, processed, outcomes };
 }
 
 // ── lifecycle (idempotent, unref'd interval) ──────────────────────────────
