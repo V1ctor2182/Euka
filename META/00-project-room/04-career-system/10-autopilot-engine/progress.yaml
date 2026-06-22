@@ -208,7 +208,7 @@ commits:
     message: "[04-career-system/10-autopilot-engine] m2: per-candidate fill driver (drives multistep machine to submit gate, never submits) (smoke 16+29)"
     milestones_affected:
       - "m2-per-candidate-fill-driver (→ completed)"
-  - hash: "TBD3"
+  - hash: "786a349"
     date: "2026-06-22"
     message: "[04-career-system/10-autopilot-engine] m3: activity feed + funnel aggregation endpoint + ROOM COMPLETE (smoke 9)"
     milestones_affected:
