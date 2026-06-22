@@ -141,7 +141,23 @@ milestones:
 
   - id: "m3-activity-feed-and-funnel-aggregation"
     name: "活动流 feed + 4 漏斗数字聚合端点 + ROOM COMPLETE"
-    status: pending
+    status: completed
+    actual_files:
+      - "src/career/autopilot/feed.mjs (~200 行: appendEvent/readRecentFeed/compactFeed/computeFunnel)"
+      - "src/career/autopilot/orchestrator.mjs (改: emit dep + 每候选 emit + tickNow)"
+      - "server.mjs (改: feed imports + autopilotEmit(含 compaction) + GET /autopilot/feed)"
+      - "scripts/smoke-autopilot-feed.mjs (~180 行, 9 tests)"
+      - "scripts/smoke-autopilot-orchestrator.mjs (改: +1 emit test → 30)"
+    actual_lines: 290
+    review_findings:
+      - "[FIX-while-here] m1 latent bug: /enable kick called tickOnce({}) (期望已合并的 deps)→ 实际静默 no-op。新增 tickNow(opts)=tickOnce(mergeDeps(opts)),/enable 改用之 → kick 真生效"
+      - "[HIGH] compactFeed 从未被调用 → feed.jsonl 无限增长 + 每次 dashboard poll 全文件读 → 修:autopilotEmit 每 50 条 compact 一次(emit 被 single-flight tick 串行化,与 append 无竞争)"
+      - "[MEDIUM] computeFunnel 串行读每个 session 文件 → 修:Promise.all 并行"
+      - "[MEDIUM] compactFeed 与并发 append 竞争丢写 → 缓解:仅在串行化的 emit 链内调用 + 注释说明"
+      - "[LOW] /feed ?limit=0/NaN 静默变 50 → 修:Number.isFinite 校验 + trunc"
+      - "[LOW] appendEvent payload.type 未在 spread 前剥离 → 修:解构剔除 type/at/ts"
+      - "[NOTE] funnel candidates 不含内存 cooldown 排除(有意:cap-ignored 稳定数,cooldown 是瞬时的)"
+      - "[NO-CYCLE confirmed] orchestrator 不 import feed;server 用 opts._emit 注入 feed.appendEvent;no-op 默认正确"
     estimated_files:
       - "src/career/autopilot/feed.mjs"
       - "server.mjs"
@@ -192,8 +208,13 @@ commits:
     message: "[04-career-system/10-autopilot-engine] m2: per-candidate fill driver (drives multistep machine to submit gate, never submits) (smoke 16+29)"
     milestones_affected:
       - "m2-per-candidate-fill-driver (→ completed)"
+  - hash: "TBD3"
+    date: "2026-06-22"
+    message: "[04-career-system/10-autopilot-engine] m3: activity feed + funnel aggregation endpoint + ROOM COMPLETE (smoke 9)"
+    milestones_affected:
+      - "m3-activity-feed-and-funnel-aggregation (→ completed) — ROOM COMPLETE"
 
 current_sprint: "Autopilot Engine (C 方案后端)"
 blockers: []
-status_note: "🚧 IN PROGRESS (2/3) — m1+m2 done. m2: fillDriver.driveOne drives the existing multistep machine (start + autoApproveWhenSafe) to the submit gate and stops — NEVER submits (the ready_for_submit escalation IS the success path → PARKED). orchestrator.fill is now driveOne; dedup excludes applications + active apply-sessions + a 6h in-memory cooldown (so a session-less failure can't burn the cap); daily_count counts every ATS-engaging outcome except login-wall + BUSY. Plan-agent review: 2 CRITICAL (ready_for_submit mis-route; session-less re-fill) + 1 HIGH (dead-session spin) + 2 MEDIUM + 1 LOW all fixed. 16/16 fill-driver + 29/29 orchestrator smoke + lint + live boot green. Next: m3 activity feed + funnel + ROOM COMPLETE.\n\n(m1 done. autopilotState.mjs (persisted on/off + daily throttle, atomic write mirroring cadenceState) + orchestrator.mjs (master-tick mirroring scheduler.mjs: selectCandidates applies all 5 locked rules, single-flight guard, never-throws) + server.mjs bootstrap (DISABLE_AUTOPILOT_ENGINE gate) + SIGTERM teardown + 4 endpoints (/autopilot/status|enable|disable|config). m1's fill is a no-op; m2 wires fillDriver. Plan-agent review: 1 CRITICAL + 1 HIGH + 3 MEDIUM + 3 LOW all fixed (Codex CLI was binary-broken). 23/23 smoke + live endpoint test green. Next: m2 per-candidate fill driver."
+status_note: "🎉 ROOM COMPLETE (3/3, 100%). The autopilot apply daemon exists: 60s master-tick picks eligible candidates (5 locked rules) → drives each through the existing multistep machine to the submit gate → NEVER submits → activity feed + 4 funnel numbers for the Dashboard. m3: feed.mjs (append-only autopilot-feed.jsonl + computeFunnel candidates/filling/parked/submitted) + GET /api/career/autopilot/feed + tickNow (fixes m1's silent /enable-kick no-op). Review: 1 HIGH (unbounded feed → periodic compaction) + 2 MEDIUM + 2 LOW all fixed; no import cycle. 9 feed + 30 orchestrator + 16 fill-driver smoke + live /feed green. Endpoints shipped for 11-autopilot-ui-reframe to consume: /autopilot/{status,enable,disable,config,feed}. Next epic: 11-autopilot-ui-reframe (Dashboard + Review + Jobs downgrade + nav).\n\n(m2: fillDriver.driveOne drives the multistep machine to the gate, never submits; dedup = applications + sessions + 6h cooldown. m1: autopilotState + orchestrator master-tick + 4 control endpoints.)\n\n(legacy m1 note: m1 done. autopilotState.mjs (persisted on/off + daily throttle, atomic write mirroring cadenceState) + orchestrator.mjs (master-tick mirroring scheduler.mjs: selectCandidates applies all 5 locked rules, single-flight guard, never-throws) + server.mjs bootstrap (DISABLE_AUTOPILOT_ENGINE gate) + SIGTERM teardown + 4 endpoints (/autopilot/status|enable|disable|config). m1's fill is a no-op; m2 wires fillDriver. Plan-agent review: 1 CRITICAL + 1 HIGH + 3 MEDIUM + 3 LOW all fixed (Codex CLI was binary-broken). 23/23 smoke + live endpoint test green. Next: m2 per-candidate fill driver."
 last_updated: "2026-06-22"

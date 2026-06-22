@@ -29,10 +29,12 @@ daemon 会**拿真简历投真公司**,以下为不可翻转的安全边界:
 
 相关文档:[`../AUTOPILOT-DESIGN.md`](../AUTOPILOT-DESIGN.md)(/loop 开发循环的由来)、[`../UI-LAYOUT.md`](../UI-LAYOUT.md)(消费本 room 端点的 UI)。
 
-## 当前进度 — 🚧 IN PROGRESS (2/3)
+## 当前进度 — 🎉 ROOM COMPLETE (3/3, 100%)
 
 - ✅ **m1-orchestrator-tick-and-lifecycle** — `autopilotState.mjs`(持久化 on/off + 每日节流,原子写)+ `orchestrator.mjs`(master-tick 镜像 scheduler.mjs,`selectCandidates` 落实 5 条铁律 + single-flight 守卫 + never-throws)+ server.mjs bootstrap(`DISABLE_AUTOPILOT_ENGINE` 门控)+ SIGTERM teardown + 4 端点。Review:1C+1H+3M+3L 全修;23/23 smoke。
 - ✅ **m2-per-candidate-fill-driver** — `fillDriver.driveOne` 驱动现有 multistep machine(start + autoApproveWhenSafe)到 submit gate 即停,**永不 submit**(`ready_for_submit` escalation 就是成功态 → PARKED)。orchestrator.fill 换成 driveOne;dedup = applications + active apply-sessions + 6h 内存 cooldown(session-less 失败不再烧 cap);计数排除登录墙 + BUSY。Review:2C(ready_for_submit 误判、session-less 重填)+1H+2M+1L 全修;16+29 smoke + 实测启动通过。
-- ⬜ m3-activity-feed-and-funnel-aggregation + ROOM COMPLETE
+- ✅ **m3-activity-feed-and-funnel-aggregation** — `feed.mjs`(append-only `autopilot-feed.jsonl` + `computeFunnel` 4 数字:候选/填表中/待批准/已提交)+ `GET /api/career/autopilot/feed` + `tickNow`(修复 m1 的 /enable kick 静默 no-op)。Review:1H(feed 无限增长→定期 compaction)+2M+2L 全修;无 import 环;9 feed + 30 orchestrator + 16 fill-driver smoke + 实测 /feed 通过。
 
-milestones 详见 `progress.yaml`。构建顺序先于 `11-autopilot-ui-reframe`(UI 消费本 room 的端点)。
+🎉 **ROOM COMPLETE** — autopilot 后端引擎就位:60s tick 选候选 → 驱动现有 multistep machine 填到 submit gate → 永不 submit → 活动流 + 漏斗给 Dashboard。已为 `11-autopilot-ui-reframe` 备好端点:`/api/career/autopilot/{status,enable,disable,config,feed}`。
+
+milestones 详见 `progress.yaml`。下一 epic:`11-autopilot-ui-reframe`(消费本 room 端点)。

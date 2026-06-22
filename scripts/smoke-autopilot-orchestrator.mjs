@@ -205,6 +205,7 @@ await test('select-5. empty / malformed inputs → []', () => {
 
 function tickDeps(overrides = {}) {
   const filled = [];
+  const emitted = [];
   let state = { ...DEFAULT_STATE, enabled: true, daily_cap: 5, daily_count: 0, daily_count_date: dayKey() };
   const deps = {
     _readState: async () => ({ ...state }),
@@ -219,9 +220,10 @@ function tickDeps(overrides = {}) {
       // Default: a successful park (counts toward the daily cap).
       return { outcome: overrides.fillOutcome ?? 'parked', jobId: cand.id, escalationCode: overrides.fillEscalationCode ?? null };
     },
+    _emit: (e) => { emitted.push(e); },
     _now: () => overrides.now ?? Date.now(),
   };
-  return { deps, filled, getState: () => state };
+  return { deps, filled, emitted, getState: () => state };
 }
 
 // tickOnce takes a merged-deps object; build it the way startAutopilot would.
@@ -235,6 +237,7 @@ function mergedFrom(t) {
     readActiveSessions: t.deps._readActiveSessions,
     isPipelineBusy: t.deps._isPipelineBusy,
     fill: t.deps._fill,
+    emit: t.deps._emit,
     now: t.deps._now,
   };
 }
@@ -380,6 +383,14 @@ await test('tick-9d. sessions-read failure → skip tick (fail-closed)', async (
   const r = await _tick(merged);
   assert.equal(r.reason, 'sessions-read-failed');
   assert.equal(t.filled.length, 0);
+});
+
+await test('tick-9g. emits one activity event per candidate with its outcome', async () => {
+  const t = tickDeps({ jobs: [job('aaaaaaaaaaaa', { score: 5 }), job('bbbbbbbbbbbb', { score: 9 })] });
+  await _tick(mergedFrom(t));
+  assert.equal(t.emitted.length, 2);
+  assert.deepEqual(t.emitted.map((e) => e.type).sort(), ['parked', 'parked']);
+  assert.ok(t.emitted.every((e) => e.jobId && e.ats === 'greenhouse'));
 });
 
 await test('tick-10. single-flight guard: overlapping tick no-ops (C1/C2)', async () => {

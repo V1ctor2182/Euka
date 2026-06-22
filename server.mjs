@@ -54,8 +54,20 @@ import { previewHardFilter } from './src/career/finder/dryRun.mjs';
 import { enrichBatch } from './src/career/finder/jdEnrich.mjs';
 import { shouldEnrich } from './src/career/finder/atsByUrl.mjs';
 import { startScheduler, stopScheduler } from './src/career/finder/scheduler.mjs';
-import { startAutopilot, stopAutopilot, tickOnce as autopilotTickOnce, selectCandidates as autopilotSelectCandidates, readPipelineJobs as autopilotReadPipelineJobs, appliedJobIdSet as autopilotAppliedJobIdSet, readActiveSessionJobIds as autopilotReadActiveSessionJobIds } from './src/career/autopilot/orchestrator.mjs';
+import { startAutopilot, stopAutopilot, tickNow as autopilotTickNow, selectCandidates as autopilotSelectCandidates, readPipelineJobs as autopilotReadPipelineJobs, appliedJobIdSet as autopilotAppliedJobIdSet, readActiveSessionJobIds as autopilotReadActiveSessionJobIds } from './src/career/autopilot/orchestrator.mjs';
 import { readAutopilotState, patchAutopilotState, withDailyReset, HARD_DAILY_CAP, MAX_SCORE_THRESHOLD } from './src/career/autopilot/autopilotState.mjs';
+import { appendEvent as autopilotAppendEvent, readRecentFeed as autopilotReadRecentFeed, computeFunnel as autopilotComputeFunnel, compactFeed as autopilotCompactFeed } from './src/career/autopilot/feed.mjs';
+
+// Wire the orchestrator's activity-feed sink to the real feed store. Kept here
+// (not in orchestrator.mjs) to avoid an import cycle (feed imports orchestrator).
+// Emits are serialized by the tick's single-flight guard, so the periodic
+// compaction (every COMPACT_EVERY events) can't race a concurrent append.
+let _autopilotEmitCount = 0;
+const AUTOPILOT_COMPACT_EVERY = 50;
+const autopilotEmit = async (e) => {
+  await autopilotAppendEvent(e?.type, e);
+  if (++_autopilotEmitCount % AUTOPILOT_COMPACT_EVERY === 0) await autopilotCompactFeed();
+};
 import { MODEL_PRICING, computeCostUsd } from './src/career/lib/anthropicPricing.mjs';
 import { evaluateJobsStageA } from './src/career/evaluator/stageARunner.mjs';
 import { evaluateJobsStageB } from './src/career/evaluator/stageBRunner.mjs';
@@ -2556,7 +2568,7 @@ if (process.env.DISABLE_SCAN_SCHEDULER !== '1') {
 // via POST /api/career/autopilot/enable). Gated by DISABLE_AUTOPILOT_ENGINE=1
 // for dev / tests, matching the scan scheduler's DISABLE_SCAN_SCHEDULER.
 if (process.env.DISABLE_AUTOPILOT_ENGINE !== '1') {
-  startAutopilot();
+  startAutopilot({ _emit: autopilotEmit });
   console.log('Autopilot engine enabled (master tick every 60s; fills only when enabled).');
 }
 
@@ -3666,8 +3678,9 @@ app.post('/api/career/autopilot/enable', async (_req, res) => {
   try {
     const state = await patchAutopilotState({ enabled: true });
     // Kick a tick immediately so the operator sees activity without waiting up
-    // to 60s for the next interval. Fire-and-forget — never blocks the response.
-    autopilotTickOnce({}).catch(() => {});
+    // to 60s for the next interval. tickNow merges real deps (tickOnce expects
+    // already-merged). Fire-and-forget — never blocks the response.
+    autopilotTickNow({ _emit: autopilotEmit }).catch(() => {});
     res.json({ enabled: state.enabled });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3703,6 +3716,22 @@ app.put('/api/career/autopilot/config', async (req, res) => {
   try {
     const state = await patchAutopilotState(parsed.data);
     res.json({ daily_cap: state.daily_cap, score_threshold: state.score_threshold });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Activity feed + the 4 funnel numbers — the single endpoint the Dashboard
+// reads (11-autopilot-ui-reframe m1). ?limit caps the activity-stream length.
+app.get('/api/career/autopilot/feed', async (req, res) => {
+  try {
+    const n = Number(req.query.limit);
+    const limit = Number.isFinite(n) ? Math.min(200, Math.max(1, Math.trunc(n))) : 50;
+    const [events, funnel] = await Promise.all([
+      autopilotReadRecentFeed(limit),
+      autopilotComputeFunnel(),
+    ]);
+    res.json({ events, funnel });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

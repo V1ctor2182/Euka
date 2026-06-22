@@ -179,6 +179,10 @@ const DEFAULT_DEPS = {
   readActiveSessions: readActiveSessionJobIds,
   isPipelineBusy,
   fill: (cand) => driveOne(cand),
+  // Activity-feed sink. Default no-op so the orchestrator doesn't import feed.mjs
+  // (which imports orchestrator helpers → would be a cycle). server.mjs wires the
+  // real feed.appendEvent via opts._emit on startAutopilot + tickNow.
+  emit: () => {},
   now: () => Date.now(),
 };
 
@@ -191,6 +195,7 @@ function mergeDeps(opts) {
     readActiveSessions: opts._readActiveSessions ?? DEFAULT_DEPS.readActiveSessions,
     isPipelineBusy: opts._isPipelineBusy ?? DEFAULT_DEPS.isPipelineBusy,
     fill: opts._fill ?? DEFAULT_DEPS.fill,
+    emit: opts._emit ?? DEFAULT_DEPS.emit,
     now: opts._now ?? DEFAULT_DEPS.now,
   };
 }
@@ -232,6 +237,15 @@ export async function tickOnce(deps) {
   } finally {
     _tickRunning = false;
   }
+}
+
+// Run a single tick with REAL (merged-from-opts) deps. This is the entry point
+// external callers (the /enable kick) should use — tickOnce expects ALREADY-
+// merged deps (the interval binds them once), so calling tickOnce({}) would run
+// against undefined deps. tickNow(opts) merges first. opts accepts the same
+// _-prefixed DI keys as startAutopilot (e.g. _emit).
+export async function tickNow(opts = {}) {
+  return tickOnce(mergeDeps(opts));
 }
 
 async function runTick(deps) {
@@ -337,6 +351,13 @@ async function runTick(deps) {
     // can't be re-picked next tick. BUSY means another driver already owns it.
     if (outcome !== FILL_OUTCOME.BUSY) recordAttempt(cand.id, now);
     if (isCountedAttempt(outcome, escalationCode)) processed += 1;
+    // Emit one activity-feed event per candidate (fire-and-forget; the sink is
+    // contracted never to throw, but guard anyway — feed must not break a tick).
+    try {
+      await deps.emit({ type: outcome, jobId: cand.id, company: cand.company, role: cand.role, ats: cand.ats, escalationCode, at: now });
+    } catch (e) {
+      console.warn('[autopilot] emit failed:', String(e?.message ?? e).slice(0, 200));
+    }
   }
 
   await persistPatch(deps, {
