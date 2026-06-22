@@ -186,7 +186,7 @@ commits:
     message: "[04-career-system/11-autopilot-ui-reframe] m1: global Autopilot toggle + Dashboard (status card + 4 funnel + activity stream) (smoke 5)"
     milestones_affected:
       - "m1-global-control-bar-and-dashboard (→ completed)"
-  - hash: "TBD-UI-M2"
+  - hash: "a3f36f8"
     date: "2026-06-22"
     message: "[04-career-system/11-autopilot-ui-reframe] m2: Review human-gate queue + nav badge + answer-banking flywheel (smoke 4)"
     milestones_affected:
