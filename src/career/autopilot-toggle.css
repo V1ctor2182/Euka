@@ -1,0 +1,59 @@
+/* Global Autopilot toggle in the Career header — apt- prefix.
+ * A pill: [power] Autopilot [ON/OFF] [N/cap today · tick ago]. */
+
+.apt-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid #e5e5e5;
+  background: #fafafa;
+  font-size: 13px;
+  cursor: pointer;
+  color: #44403c;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.apt-wrap:hover:not(:disabled) { background: #f0f0f0; }
+.apt-wrap:disabled { cursor: default; opacity: 0.85; }
+
+.apt-loading { cursor: default; color: #78716c; }
+
+.apt-label { font-weight: 600; }
+
+.apt-state {
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  padding: 1px 7px;
+  border-radius: 999px;
+}
+
+/* ON — green */
+.apt-on {
+  border-color: #86efac;
+  background: #f0fdf4;
+  color: #166534;
+}
+.apt-on .apt-state { background: #16a34a; color: #fff; }
+.apt-on:hover:not(:disabled) { background: #dcfce7; }
+
+/* OFF — muted gray */
+.apt-off .apt-state { background: #d6d3d1; color: #44403c; }
+
+/* error fetching status — subtle red ring, still clickable */
+.apt-err { border-color: #fecaca; }
+
+.apt-meta {
+  font-size: 11px;
+  color: #78716c;
+  font-variant-numeric: tabular-nums;
+}
+
+.apt-spin { animation: apt-spin 1s linear infinite; }
+@keyframes apt-spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 640px) {
+  /* tighten on small screens — drop the meta line */
+  .apt-meta { display: none; }
+}

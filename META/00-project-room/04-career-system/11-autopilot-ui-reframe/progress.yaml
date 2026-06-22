@@ -1,7 +1,22 @@
 milestones:
   - id: "m1-global-control-bar-and-dashboard"
     name: "全局 Autopilot 控制条 + Dashboard 控制台(状态卡 + 4 漏斗 + 活动流)"
-    status: pending
+    status: completed
+    actual_files:
+      - "src/career/AutopilotToggle.tsx (~130 行) + autopilot-toggle.css"
+      - "src/career/Dashboard.tsx (~230 行) + dashboard.css"
+      - "src/CareerApp.tsx (改: header toggle + /dashboard route + RootRedirect→dashboard)"
+      - "src/career/CareerNav.tsx (改: Dashboard 设为首个主 tab)"
+      - "src/career.css (改: .c-header-right)"
+      - "scripts/smoke-dashboard-page.mjs (~140 行, 5 tests)"
+    actual_lines: 560
+    review_findings:
+      - "[MEDIUM] toggle 的 post-fetch/rollback 无 mounted 守卫 → 卸载后 setState → 修:两组件加 mountedRef,卸载置 false 并守卫所有 setState"
+      - "[MEDIUM] rollback 用 click 时的 stale snapshot 覆盖 poller 刚拉到的计数 → 修:functional setState 只回滚 enabled"
+      - "[LOW] 填表中卡片用 Loader2(静态不转)像坏掉 → 修:换 PenLine 图标"
+      - "[VERIFIED] RootRedirect 不会死循环(VALID_TABS 全有对应 route);feed/funnel null 安全;AbortController+interval 清理正确;engine_disabled 禁用开关"
+      - "[NOTE] header toggle 与 Dashboard 状态卡是两个独立 poller,Dashboard 页同时存在时最多 30s 短暂不同步 — m1 可接受,未来可提共享 store"
+      - "[PRE-EXISTING] tsc -b 在 Apply.tsx 有历史报错(非本次文件);项目走 vite build(esbuild 无类型检查),vite build 干净"
     estimated_files:
       - "src/CareerApp.tsx"
       - "src/career/CareerNav.tsx"
@@ -148,8 +163,14 @@ milestones:
       验收: smoke 全绿;手动:导航是 5 tab;legacy bookmark 不 404;Profile 分三组;
       ROOM COMPLETE。
 
+commits:
+  - hash: "TBD-UI-M1"
+    date: "2026-06-22"
+    message: "[04-career-system/11-autopilot-ui-reframe] m1: global Autopilot toggle + Dashboard (status card + 4 funnel + activity stream) (smoke 5)"
+    milestones_affected:
+      - "m1-global-control-bar-and-dashboard (→ completed)"
+
 current_sprint: "Autopilot UI Reframe (C 方案 UI)"
-blockers:
-  - "依赖 10-autopilot-engine 的端点(/status /enable /disable /feed /queue);10 未 ready 时可对 stub 开发,联调需 10 完成"
-status_note: "🚧 PLANNING — 4 milestones。把手动浏览式 UI 重构为自动化优先:Dashboard 控制台 + Review 闸门队列为主舞台,Jobs/Sources/Filters 降级。详见 ../UI-LAYOUT.md。"
-last_updated: "2026-06-21"
+blockers: []
+status_note: "🚧 IN PROGRESS (1/4) — m1 done. Global AutopilotToggle in the Career header (poll /autopilot/status, optimistic ON/OFF) + new Dashboard landing page (status card + 4 funnel cards 候选/填表中/待批准/已提交 from /autopilot/feed + activity stream of per-candidate outcomes). Dashboard is the new landing tab (RootRedirect→dashboard, first nav tab). Consumes 10-autopilot-engine endpoints — engine room is COMPLETE so this is live, not stubbed. Review (Plan agent): 2 MEDIUM (unmounted setState; stale rollback) + 1 LOW (frozen spinner icon) fixed; no critical/high; redirect loop-safe. 5/5 dashboard smoke + vite build clean + lint. (tsc -b has pre-existing Apply.tsx errors, not ours.) Next: m2 Review gate queue. 详见 ../UI-LAYOUT.md。"
+last_updated: "2026-06-22"

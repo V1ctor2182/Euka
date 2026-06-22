@@ -2,6 +2,7 @@ import { NavLink } from 'react-router-dom'
 import { useState } from 'react'
 import {
   LayoutDashboard,
+  Gauge,
   Search,
   Send,
   User,
@@ -18,7 +19,10 @@ import {
 // (Overview / Pipeline / Shortlist / Applied / Prep / Learning / Iteration / Settings)
 // into 3 user-flavored tabs + an Advanced overflow. Old tabs stay
 // accessible from Advanced so existing bookmarks don't 404.
+// autopilot-ui-reframe m1: Dashboard becomes the first/landing tab. The full nav
+// reframe (Review badge, Jobs/Tracker rename, debug→Profile) lands in m4.
 const PRIMARY_TABS: Array<{ to: string; label: string; Icon: typeof LayoutDashboard }> = [
+  { to: '/career/dashboard', label: 'Dashboard', Icon: Gauge },
   { to: '/career/find-jobs', label: 'Find Jobs', Icon: Search },
   { to: '/career/applied', label: 'Apply & Track', Icon: Send },
   { to: '/career/settings', label: 'Profile', Icon: User },

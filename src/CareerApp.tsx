@@ -2,6 +2,8 @@ import { useEffect } from 'react'
 import { Link, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { ArrowLeft, Briefcase } from 'lucide-react'
 import CareerNav from './career/CareerNav'
+import AutopilotToggle from './career/AutopilotToggle'
+import Dashboard from './career/Dashboard'
 import Overview from './career/Overview'
 import Pipeline from './career/Pipeline'
 import Shortlist from './career/Shortlist'
@@ -29,24 +31,25 @@ import Integrations from './career/settings/Integrations'
 import './career.css'
 
 const LAST_TAB_KEY = 'career-last-tab'
-const VALID_TABS = ['find-jobs', 'overview', 'pipeline', 'shortlist', 'applied', 'prep', 'learning', 'iteration', 'reports', 'settings']
+const VALID_TABS = ['dashboard', 'find-jobs', 'overview', 'pipeline', 'shortlist', 'applied', 'prep', 'learning', 'iteration', 'reports', 'settings']
 
 // localStorage can throw in Safari private mode, when over quota, or when
 // disabled by extension. Don't crash the app boot for a UX nicety.
 function readLastTab(): string {
   try {
     const raw = localStorage.getItem(LAST_TAB_KEY)
-    return raw && VALID_TABS.includes(raw) ? raw : 'overview'
+    return raw && VALID_TABS.includes(raw) ? raw : 'dashboard'
   } catch {
-    return 'overview'
+    return 'dashboard'
   }
 }
 
 function RootRedirect() {
-  // find-jobs-redesign m1.e: legacy users last-tab='overview' get steered
-  // to the new Find Jobs page; otherwise honor their saved choice.
+  // autopilot-ui-reframe m1: Dashboard is the new landing page. Legacy
+  // last-tab='overview' (the old default) gets steered to Dashboard; otherwise
+  // honor the saved choice.
   const last = readLastTab()
-  return <Navigate to={last === 'overview' ? 'find-jobs' : last} replace />
+  return <Navigate to={last === 'overview' ? 'dashboard' : last} replace />
 }
 
 export default function CareerApp() {
@@ -71,6 +74,9 @@ export default function CareerApp() {
           <Briefcase size={20} strokeWidth={2} />
           <h1>Career</h1>
         </div>
+        <div className="c-header-right">
+          <AutopilotToggle />
+        </div>
       </header>
 
       <CareerNav />
@@ -78,6 +84,7 @@ export default function CareerApp() {
       <main className="c-body">
         <Routes>
           <Route index element={<RootRedirect />} />
+          <Route path="dashboard" element={<Dashboard />} />
           <Route path="find-jobs" element={<FindJobs />} />
           <Route path="overview" element={<Overview />} />
           <Route path="pipeline" element={<Pipeline />} />

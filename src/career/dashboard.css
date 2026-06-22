@@ -1,0 +1,95 @@
+/* Autopilot Dashboard — db- prefix. Status card + 4 funnel cards + activity. */
+
+.db-page { /* relies on c-page base */ }
+
+.db-muted { color: #78716c; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+.db-error {
+  display: flex; align-items: center; gap: 6px;
+  color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca;
+  padding: 10px 14px; border-radius: 6px; font-size: 13px; margin: 8px 0;
+}
+.db-spin { animation: db-spin 1s linear infinite; }
+@keyframes db-spin { to { transform: rotate(360deg); } }
+
+/* ── status card ───────────────────────────────────────────── */
+.db-status {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 18px 20px; border-radius: 10px; margin: 12px 0 20px;
+  border: 1px solid #e5e5e5; background: #fff;
+}
+.db-status-on { border-color: #86efac; background: #f0fdf4; }
+.db-status-off { background: #fafafa; }
+.db-status-main { display: flex; align-items: center; gap: 14px; }
+.db-led {
+  width: 12px; height: 12px; border-radius: 999px; background: #d6d3d1;
+  box-shadow: 0 0 0 4px #f5f5f4;
+}
+.db-led-on { background: #16a34a; box-shadow: 0 0 0 4px #dcfce7; animation: db-pulse 2s ease-in-out infinite; }
+@keyframes db-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+.db-status-title { font-size: 18px; }
+.db-status-title strong { font-weight: 800; }
+.db-status-sub { font-size: 12px; color: #78716c; margin-top: 2px; }
+.db-status-actions { display: flex; align-items: center; gap: 8px; }
+
+.db-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 13px; border-radius: 6px; font-size: 13px; font-weight: 600;
+  border: 1px solid #e5e5e5; background: #fff; color: #44403c; cursor: pointer;
+  text-decoration: none;
+}
+.db-btn:hover:not(:disabled) { background: #f5f5f4; }
+.db-btn:disabled { opacity: 0.6; cursor: default; }
+.db-btn-primary { background: #16a34a; border-color: #16a34a; color: #fff; }
+.db-btn-primary:hover:not(:disabled) { background: #15803d; }
+.db-btn-warn { background: #f59e0b; border-color: #f59e0b; color: #fff; }
+.db-btn-warn:hover:not(:disabled) { background: #d97706; }
+.db-btn-ghost { background: #fff; }
+
+/* ── funnel cards ──────────────────────────────────────────── */
+.db-funnel {
+  display: flex; align-items: stretch; gap: 8px; margin-bottom: 24px; flex-wrap: wrap;
+}
+.db-funnel-arrow { display: flex; align-items: center; color: #d6d3d1; font-size: 18px; }
+.db-card {
+  flex: 1 1 0; min-width: 120px;
+  display: flex; flex-direction: column; align-items: flex-start;
+  padding: 14px 16px; border-radius: 10px; border: 1px solid #e5e5e5; background: #fff;
+  text-decoration: none; color: inherit;
+}
+.db-card-link { transition: border-color 0.15s, box-shadow 0.15s; }
+.db-card-link:hover { border-color: #a8a29e; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
+.db-card-icon { color: #a8a29e; margin-bottom: 6px; }
+.db-card-n { font-size: 30px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+.db-card-label { font-size: 13px; font-weight: 600; margin-top: 4px; }
+.db-card-hint { font-size: 11px; color: #78716c; margin-top: 2px; }
+/* highlight the "待批准" card — the user's action queue */
+.db-card-hi { border-color: #fbbf24; background: #fffbeb; }
+.db-card-hi .db-card-icon { color: #d97706; }
+.db-card-hi:hover { border-color: #f59e0b; }
+
+/* ── activity stream ───────────────────────────────────────── */
+.db-activity { }
+.db-activity-head { display: flex; align-items: center; gap: 6px; font-size: 14px; margin: 0 0 10px; }
+.db-feed { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.db-feed-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-radius: 6px; font-size: 13px; border: 1px solid transparent;
+}
+.db-feed-row:hover { background: #fafafa; }
+.db-feed-icon { flex: none; }
+.db-feed-time { color: #a8a29e; font-size: 11px; width: 64px; flex: none; font-variant-numeric: tabular-nums; }
+.db-feed-co { font-weight: 600; flex: none; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.db-feed-label { color: #57534e; flex: 1; }
+.db-feed-action { color: #2563eb; text-decoration: none; font-size: 12px; flex: none; }
+.db-feed-action:hover { text-decoration: underline; }
+/* tones */
+.db-tone-ok .db-feed-icon { color: #16a34a; }
+.db-tone-warn .db-feed-icon { color: #d97706; }
+.db-tone-bad .db-feed-icon { color: #dc2626; }
+.db-tone-muted .db-feed-icon { color: #a8a29e; }
+
+@media (max-width: 640px) {
+  .db-status { flex-direction: column; align-items: stretch; }
+  .db-funnel-arrow { display: none; }
+  .db-feed-co { max-width: 140px; }
+}

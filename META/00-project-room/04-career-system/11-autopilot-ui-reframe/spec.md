@@ -22,6 +22,11 @@
 3. **Jobs 页降级** — Sources→状态条、Filters→左栏、Apply→"加入投递队列"(真入队到编排器)。
 4. **导航重排 + Profile 归类** — Dashboard/Review/Jobs/Tracker/Profile;删 legacy;debug 收进 Dev/Debug。
 
-## 当前进度 — 🚧 PLANNING (0/4)
+## 当前进度 — 🚧 IN PROGRESS (1/4)
 
-milestones 见 `progress.yaml`。依赖 `10-autopilot-engine`(后端引擎先行);10 的端点 ready 后本 room 才能接真数据。UI 壳可先对 stub 端点开发。
+- ✅ **m1-global-control-bar-and-dashboard** — 顶栏全局 `AutopilotToggle`(poll `/autopilot/status`,乐观 ON/OFF)+ 新 `Dashboard` 落地页(状态卡 + 4 漏斗卡 候选/填表中/待批准/已提交,读 `/autopilot/feed` + 活动流)。Dashboard 设为落地 tab。消费 `10-autopilot-engine`(已 COMPLETE,真数据)。Review:2M+1L 全修,redirect 无环;5/5 smoke + vite build + lint。
+- ⬜ m2-review-gate-queue
+- ⬜ m3-jobs-page-downgrade
+- ⬜ m4-nav-reframe-profile-reclass-room-complete
+
+milestones 见 `progress.yaml`。`10-autopilot-engine` 端点已就绪(真数据,非 stub)。
