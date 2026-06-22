@@ -23,6 +23,7 @@ import { isPipelineBusy, PIPELINE_FILE } from '../finder/scanRunner.mjs';
 import { readApplications } from '../applications/store.mjs';
 import { APPLY_SESSIONS_DIR, JOB_ID_RE as SESSION_JOB_ID_RE } from '../applier/multistep/applySessionsStore.mjs';
 import { driveOne, FILL_OUTCOME } from './fillDriver.mjs';
+import { readQueue as readManualQueue, dequeue as dequeueManual } from './autopilotQueue.mjs';
 import {
   readAutopilotState,
   patchAutopilotState,
@@ -183,6 +184,8 @@ const DEFAULT_DEPS = {
   // (which imports orchestrator helpers → would be a cycle). server.mjs wires the
   // real feed.appendEvent via opts._emit on startAutopilot + tickNow.
   emit: () => {},
+  readQueue: readManualQueue,
+  dequeue: dequeueManual,
   now: () => Date.now(),
 };
 
@@ -196,6 +199,8 @@ function mergeDeps(opts) {
     isPipelineBusy: opts._isPipelineBusy ?? DEFAULT_DEPS.isPipelineBusy,
     fill: opts._fill ?? DEFAULT_DEPS.fill,
     emit: opts._emit ?? DEFAULT_DEPS.emit,
+    readQueue: opts._readQueue ?? DEFAULT_DEPS.readQueue,
+    dequeue: opts._dequeue ?? DEFAULT_DEPS.dequeue,
     now: opts._now ?? DEFAULT_DEPS.now,
   };
 }
@@ -305,11 +310,40 @@ async function runTick(deps) {
     if (id?.id && inCooldown(id.id, now)) appliedJobIds.add(id.id);
   }
 
-  const picked = selectCandidates(jobs, {
+  // FORCED pass: jobs the user manually queued via "让机器投" jump the score
+  // threshold (they chose them on purpose), but still obey the other rules —
+  // solved ATS only, never re-apply / not in-session / not in cooldown, and the
+  // daily cap. Everything else is filled by the normal score-based selection.
+  let queued = [];
+  try { queued = await deps.readQueue(); } catch { queued = []; }
+  const jobById = new Map(jobs.map((j) => [j?.id, j]).filter(([id]) => id));
+  const forced = [];
+  const drainable = []; // queued ids that can NEVER be force-picked → drain now
+  for (const id of queued) {
+    if (appliedJobIds.has(id)) { drainable.push(id); continue; } // applied/in-session/cooldown → done
+    const job = jobById.get(id);
+    if (!job) { drainable.push(id); continue; } // scanned out of pipeline → stale
+    const ats = atsOf(job);
+    if (!ats || !AUTO_ATS.includes(ats)) { drainable.push(id); continue; } // unsolved ATS → can't auto-fill
+    // Eligible. Take it if there's cap room; otherwise leave it queued to retry
+    // next tick (do NOT drain — it's still a valid pending request).
+    if (forced.length < remaining) {
+      forced.push({ id: job.id, url: job.url, company: job.company, role: job.role, ats, score: scoreOf(job), forced: true });
+    }
+  }
+  const forcedIds = new Set(forced.map((f) => f.id));
+  // Drain ineligible queued ids immediately (covers the no-candidate early
+  // return below too, so stale ids can't leak forever).
+  if (drainable.length) {
+    deps.dequeue(drainable).catch((e) => console.warn('[autopilot] drain failed:', String(e?.message ?? e).slice(0, 200)));
+  }
+  // Fill the rest of the cap by score, excluding anything already forced.
+  const byScore = selectCandidates(jobs, {
     threshold: state.score_threshold,
-    limit: remaining,
-    appliedJobIds,
+    limit: remaining - forced.length,
+    appliedJobIds: new Set([...appliedJobIds, ...forcedIds]),
   });
+  const picked = [...forced, ...byScore];
 
   // Persist the day-rollover reset on EVERY tick (not just productive ones):
   // state.daily_count/daily_count_date here are already post-withDailyReset, so
@@ -365,6 +399,18 @@ async function runTick(deps) {
     daily_count: state.daily_count + processed,
     daily_count_date: today,
   });
+
+  // Drain the manual queue of every forced job we actually attempted this tick.
+  // EXCLUDE BUSY: a BUSY forced job had another fill in-flight, so it wasn't
+  // really processed — keep it queued so it retries next tick (else the user's
+  // "让机器投" request is silently dropped).
+  const busyIds = new Set(outcomes.filter((o) => o.outcome === FILL_OUTCOME.BUSY).map((o) => o.id));
+  const attemptedForced = picked.filter((c) => forcedIds.has(c.id) && !busyIds.has(c.id)).map((c) => c.id);
+  if (attemptedForced.length) {
+    try { await deps.dequeue(attemptedForced); } catch (e) {
+      console.warn('[autopilot] dequeue failed:', String(e?.message ?? e).slice(0, 200));
+    }
+  }
 
   return { fired: true, picked, processed, outcomes };
 }

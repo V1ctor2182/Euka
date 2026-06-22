@@ -10,10 +10,10 @@
 //
 // [View raw N→] in the Filters section opens RawJobsDrawer (m1.c).
 
-import { useEffect, useMemo, useState, useCallback } from 'react'
-import { ChevronDown, ChevronRight, RefreshCw, Layers, SlidersHorizontal, Eye, Send } from 'lucide-react'
-import { Link } from 'react-router-dom'
-import JobCard, { type JobCardModel } from './JobCard'
+import { useEffect, useMemo, useState, useCallback, useRef } from 'react'
+import { RefreshCw, SlidersHorizontal, Eye } from 'lucide-react'
+import { Link, useNavigate } from 'react-router-dom'
+import JobCard, { type JobCardModel, type MachineState } from './JobCard'
 import RawJobsDrawer from './RawJobsDrawer'
 import JobDetailDrawer from './JobDetailDrawer'
 import './find-jobs.css'
@@ -60,6 +60,7 @@ type Preferences = {
 const PAGE_SIZE = 24
 
 export default function FindJobs() {
+  const navigate = useNavigate()
   const [pipeline, setPipeline] = useState<PipelineResp | null>(null)
   const [pipelineError, setPipelineError] = useState<string | null>(null)
   const [rawSummary, setRawSummary] = useState<RawSummary | null>(null)
@@ -67,8 +68,6 @@ export default function FindJobs() {
   const [prefs, setPrefs] = useState<Preferences | null>(null)
   const [prefsDirty, setPrefsDirty] = useState(false)
   const [savingPrefs, setSavingPrefs] = useState(false)
-  const [sourcesOpen, setSourcesOpen] = useState(false)
-  const [filtersOpen, setFiltersOpen] = useState(false)
   const [highlightFilter, setHighlightFilter] = useState<string | null>(null)
   const [rawDrawerOpen, setRawDrawerOpen] = useState(false)
   const [detailJob, setDetailJob] = useState<JobCardModel | null>(null)
@@ -78,6 +77,8 @@ export default function FindJobs() {
   const [refiltering, setRefiltering] = useState(false)
   const [refilterMsg, setRefilterMsg] = useState<string | null>(null)
   const [applyMessage, setApplyMessage] = useState<string | null>(null)
+  // jobId → what the autopilot machine is doing with it (queued/filling/submit/failed).
+  const [machineMap, setMachineMap] = useState<Record<string, MachineState>>({})
 
   // ── data fetchers ────────────────────────────────────────────────────
 
@@ -136,6 +137,34 @@ export default function FindJobs() {
   useEffect(() => {
     fetchSidecar()
   }, [fetchSidecar])
+
+  // Machine-state map: which jobs the daemon has queued / is filling / parked /
+  // failed, so each card shows the right action. Polled so it stays fresh.
+  const machineMounted = useRef(true)
+  const fetchMachineMap = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const [review, queue] = await Promise.all([
+        fetch('/api/career/autopilot/review', { signal }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+        fetch('/api/career/autopilot/queue', { signal }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      ])
+      if (!machineMounted.current) return
+      const map: Record<string, MachineState> = {}
+      for (const id of queue?.queue ?? []) if (typeof id === 'string') map[id] = 'queued'
+      // Sessions override queue (a job being filled/parked is past "queued").
+      for (const it of review?.groups?.filling ?? []) if (it?.jobId) map[it.jobId] = 'filling'
+      for (const it of review?.groups?.submit ?? []) if (it?.jobId) map[it.jobId] = 'submit'
+      for (const it of review?.groups?.failed ?? []) if (it?.jobId) map[it.jobId] = 'failed'
+      setMachineMap(map)
+    } catch { /* fail-soft — cards just show 让机器投 */ }
+  }, [])
+
+  useEffect(() => {
+    machineMounted.current = true
+    const ctrl = new AbortController()
+    fetchMachineMap(ctrl.signal)
+    const t = setInterval(() => fetchMachineMap(ctrl.signal), 30_000)
+    return () => { machineMounted.current = false; ctrl.abort(); clearInterval(t) }
+  }, [fetchMachineMap])
 
   // ── actions ──────────────────────────────────────────────────────────
 
@@ -225,8 +254,8 @@ export default function FindJobs() {
   }
 
   function adjustFilter(rule: string) {
+    // Filters now live in an always-on left rail; just highlight + scroll to it.
     setHighlightFilter(rule)
-    setFiltersOpen(true)
     setRawDrawerOpen(false)
     setTimeout(() => {
       const el = document.querySelector('[data-filter-section]')
@@ -234,12 +263,27 @@ export default function FindJobs() {
     }, 50)
   }
 
-  function startApply(job: JobCardModel) {
-    // m1 just navigates to the existing Apply route. Full Apply tab
-    // redesign lands in m2 of the redesign series.
-    setApplyMessage(`Starting Mode 2 applier for ${job.company} — ${job.role}`)
-    // The existing Apply.tsx route lives at /career/apply/:jobId
-    window.location.href = `/career/apply/${encodeURIComponent(job.id)}`
+  // "让机器投" — hand the job to the autopilot daemon (forced pass, bypasses the
+  // score threshold). The daemon fills it to the submit gate on its next tick
+  // when Autopilot is ON; the result shows up in Review. Optimistically mark the
+  // card 'queued'.
+  async function startApply(job: JobCardModel) {
+    setMachineMap((m) => ({ ...m, [job.id]: 'queued' }))
+    setApplyMessage(`已把 ${job.company} — ${job.role} 交给机器(打开 Autopilot 后自动填,完成在 Review)`)
+    try {
+      const r = await fetch('/api/career/autopilot/enqueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: job.id }),
+      })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      // Keep the optimistic 'queued'; the 30s poll confirms + upgrades the state
+      // once the daemon picks it up. (Refetching now could race the queue write
+      // and clobber the optimistic update.)
+    } catch (e) {
+      setMachineMap((m) => { const n = { ...m }; delete n[job.id]; return n }) // rollback
+      setApplyMessage(`入队失败:${e instanceof Error ? e.message : ''}`)
+    }
   }
 
   // ── derived view state ───────────────────────────────────────────────
@@ -253,173 +297,119 @@ export default function FindJobs() {
 
   return (
     <div className="c-fj-root">
-      <header className="c-fj-header">
-        <h2 className="c-fj-title">Find Jobs</h2>
-        <p className="c-fj-sub">
-          数据源 → 筛选 → 候选职位 全部在这里. 点 [View] 看 JD 详情, 点 [Apply] 发起申请.
-        </p>
-      </header>
-
-      {/* ① Sources */}
-      <section className="c-fj-section">
+      {/* Sources → a one-line status bar (autopilot-ui-reframe m3). Full source
+          config lives in Profile; this page is透明度/干预, not the daily driver. */}
+      <div className="c-fj-statusbar">
+        <RefreshCw size={14} className={scanning || scanStatus?.state === 'running' ? 'c-fj-spin' : ''} />
+        <span className="c-fj-statusbar-summary">{sourcesSummary}</span>
         <button
           type="button"
-          className="c-fj-section-head"
-          onClick={() => setSourcesOpen((o) => !o)}
-          aria-expanded={sourcesOpen}
+          className="c-fj-btn c-fj-btn-ghost"
+          disabled={scanning || scanStatus?.state === 'running'}
+          onClick={runScan}
         >
-          {sourcesOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-          <Layers size={14} />
-          <span className="c-fj-section-title">① Sources</span>
-          <span className="c-fj-section-summary">{sourcesSummary}</span>
-          <span className="c-fj-section-spacer" />
-          <Link to="/career/settings/portals" className="c-fj-btn c-fj-btn-ghost" onClick={(e) => e.stopPropagation()}>
-            Manage
-          </Link>
-          <button
-            type="button"
-            className="c-fj-btn c-fj-btn-ghost"
-            disabled={scanning || scanStatus?.state === 'running'}
-            onClick={(e) => {
-              e.stopPropagation()
-              runScan()
-            }}
-          >
-            <RefreshCw size={13} className={scanning ? 'c-fj-spin' : ''} /> {scanning ? 'Scanning…' : 'Scan now'}
-          </button>
+          {scanning ? 'Scanning…' : 'Scan now'}
         </button>
-        {sourcesOpen && (
-          <div className="c-fj-section-body">
-            <p className="c-fj-muted">
-              Configure data sources (Greenhouse / Ashby / Lever / GitHub markdown lists)
-              in <Link to="/career/settings/portals">Settings → Portals</Link>.
-            </p>
-            {rawSummary && (
-              <div className="c-fj-source-stats">
-                <span><strong>{rawSummary.total}</strong> raw jobs</span>
-                <span><strong>{rawSummary.passed}</strong> passed</span>
-                <span><strong>{rawSummary.dropped}</strong> dropped</span>
-                {rawSummary.last_scan_at && (
-                  <span className="c-fj-muted">last scan: {new Date(rawSummary.last_scan_at).toLocaleString()}</span>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-      </section>
+        <Link to="/career/settings/portals" className="c-fj-btn c-fj-btn-ghost">Manage sources</Link>
+        <span className="c-fj-section-spacer" />
+        <input
+          className="c-fj-search"
+          type="search"
+          placeholder="Filter by company or role…"
+          value={search}
+          onChange={(e) => changeSearch(e.target.value)}
+        />
+      </div>
 
-      {/* ② Filters */}
-      <section className="c-fj-section" data-filter-section>
-        <button
-          type="button"
-          className="c-fj-section-head"
-          onClick={() => setFiltersOpen((o) => !o)}
-          aria-expanded={filtersOpen}
-        >
-          {filtersOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-          <SlidersHorizontal size={14} />
-          <span className="c-fj-section-title">② Filters</span>
-          <span className="c-fj-section-summary">{filterSummary}</span>
-          <span className="c-fj-section-spacer" />
+      {/* Two-column: left filter rail (always on) + right candidates main */}
+      <div className="c-fj-layout">
+        <aside className="c-fj-rail" data-filter-section>
+          <div className="c-fj-rail-head">
+            <SlidersHorizontal size={14} />
+            <span className="c-fj-section-title">筛选标准</span>
+          </div>
+          <p className="c-fj-rail-sub">机器照此找。{filterSummary}</p>
           {rawSummary && rawSummary.total > 0 && (
-            <>
+            <div className="c-fj-rail-actions">
               <button
                 type="button"
                 className="c-fj-btn c-fj-btn-ghost"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  void reapplyFilters()
-                }}
+                onClick={() => void reapplyFilters()}
                 disabled={refiltering}
-                title="Re-apply current filters to the last scan's raw jobs without re-fetching ATS APIs. Use this after changing filters to see them take effect."
+                title="Re-apply current filters to the last scan's raw jobs without re-fetching ATS APIs."
               >
                 <RefreshCw size={13} className={refiltering ? 'c-fj-spin' : ''} />
                 {refiltering ? 'Re-filtering…' : 'Re-filter all'}
               </button>
-              <button
-                type="button"
-                className="c-fj-btn c-fj-btn-ghost"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  setRawDrawerOpen(true)
-                }}
-              >
+              <button type="button" className="c-fj-btn c-fj-btn-ghost" onClick={() => setRawDrawerOpen(true)}>
                 <Eye size={13} /> View raw {rawSummary.total}→
               </button>
+            </div>
+          )}
+          {refilterMsg && (
+            <p className={`c-fj-refilter-msg${refilterMsg.startsWith('✓') ? ' c-fj-refilter-msg-ok' : ' c-fj-refilter-msg-bad'}`}>
+              {refilterMsg}
+            </p>
+          )}
+          {prefs && (
+            <FilterEditor
+              prefs={prefs}
+              onPatch={patchHardFilter}
+              dirty={prefsDirty}
+              saving={savingPrefs}
+              onSave={savePrefs}
+              highlight={highlightFilter}
+              droppedByRule={rawSummary?.dropped_by_rule || {}}
+            />
+          )}
+        </aside>
+
+        <main className="c-fj-main">
+          <div className="c-fj-cards-head">
+            <h3 className="c-fj-section-title">候选职位 · {pipeline?.filtered ?? '…'}</h3>
+          </div>
+          {pipelineError && <p className="c-fj-error">Failed to load: {pipelineError}</p>}
+          {applyMessage && <p className="c-fj-applymsg">{applyMessage}</p>}
+          {!pipeline ? (
+            <p className="c-fj-muted">Loading…</p>
+          ) : pipeline.total === 0 ? (
+            <div className="c-fj-empty">
+              <strong>No jobs scanned yet.</strong>
+              <p>Configure sources in <Link to="/career/settings/portals">Settings → Portals</Link>, then click <em>Scan now</em>.</p>
+            </div>
+          ) : pipeline.filtered === 0 && search.trim() === '' ? (
+            <div className="c-fj-empty">
+              <strong>0 jobs pass your filters.</strong>
+              <p>Scan returned <strong>{rawSummary?.total ?? pipeline.total}</strong> raw jobs, but
+              hard filters dropped them all. Loosen the rules in the left rail,
+              or click <em>View raw</em> to see what got dropped and why.</p>
+            </div>
+          ) : pipeline.filtered === 0 ? (
+            <div className="c-fj-empty"><p>No jobs match your search.</p></div>
+          ) : (
+            <>
+              <div className="c-fj-cards-grid">
+                {pipeline.jobs.map((job) => (
+                  <JobCard
+                    key={job.id}
+                    job={job}
+                    machineState={machineMap[job.id] ?? null}
+                    onView={(j) => setDetailJob(j)}
+                    onApply={startApply}
+                    onOpenReview={() => navigate('/career/review')}
+                  />
+                ))}
+              </div>
+              <Pager
+                offset={offset}
+                pageSize={PAGE_SIZE}
+                filtered={pipeline.filtered}
+                onChange={setOffset}
+              />
             </>
           )}
-        </button>
-        {refilterMsg && (
-          <p className={`c-fj-refilter-msg${refilterMsg.startsWith('✓') ? ' c-fj-refilter-msg-ok' : ' c-fj-refilter-msg-bad'}`}>
-            {refilterMsg}
-          </p>
-        )}
-        {filtersOpen && prefs && (
-          <FilterEditor
-            prefs={prefs}
-            onPatch={patchHardFilter}
-            dirty={prefsDirty}
-            saving={savingPrefs}
-            onSave={savePrefs}
-            highlight={highlightFilter}
-            droppedByRule={rawSummary?.dropped_by_rule || {}}
-          />
-        )}
-      </section>
-
-      {/* ③ Candidate jobs */}
-      <section className="c-fj-section c-fj-section-cards">
-        <div className="c-fj-cards-head">
-          <h3 className="c-fj-section-title">③ Candidate jobs · {pipeline?.filtered ?? '…'}</h3>
-          <input
-            className="c-fj-search"
-            type="search"
-            placeholder="Filter by company or role…"
-            value={search}
-            onChange={(e) => changeSearch(e.target.value)}
-          />
-        </div>
-        {pipelineError && (
-          <p className="c-fj-error">Failed to load: {pipelineError}</p>
-        )}
-        {applyMessage && <p className="c-fj-muted">{applyMessage}</p>}
-        {!pipeline ? (
-          <p className="c-fj-muted">Loading…</p>
-        ) : pipeline.total === 0 ? (
-          <div className="c-fj-empty">
-            <strong>No jobs scanned yet.</strong>
-            <p>Configure sources in <Link to="/career/settings/portals">Settings → Portals</Link>, then click <em>Scan now</em>.</p>
-          </div>
-        ) : pipeline.filtered === 0 && search.trim() === '' ? (
-          <div className="c-fj-empty">
-            <strong>0 jobs pass your filters.</strong>
-            <p>Scan returned <strong>{rawSummary?.total ?? pipeline.total}</strong> raw jobs, but
-            hard filters dropped them all. Open <em>② Filters</em> above to loosen the rules,
-            or click <em>View raw</em> to see what got dropped and why.</p>
-          </div>
-        ) : pipeline.filtered === 0 ? (
-          <div className="c-fj-empty"><p>No jobs match your search.</p></div>
-        ) : (
-          <>
-            <div className="c-fj-cards-grid">
-              {pipeline.jobs.map((job) => (
-                <JobCard
-                  key={job.id}
-                  job={job}
-                  onView={(j) => setDetailJob(j)}
-                  onApply={startApply}
-                />
-              ))}
-            </div>
-            <Pager
-              offset={offset}
-              pageSize={PAGE_SIZE}
-              filtered={pipeline.filtered}
-              onChange={setOffset}
-            />
-          </>
-        )}
-      </section>
+        </main>
+      </div>
 
       {/* Drawers */}
       {rawDrawerOpen && (

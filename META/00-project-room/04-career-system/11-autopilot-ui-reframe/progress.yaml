@@ -110,7 +110,24 @@ milestones:
 
   - id: "m3-jobs-page-downgrade"
     name: "Jobs 页降级(Sources→状态条、Filters→左栏、Apply→加入投递队列)"
-    status: pending
+    status: completed
+    actual_files:
+      - "src/career/autopilot/autopilotQueue.mjs (NEW: 手动队列 read/enqueue/dequeue + 200 cap)"
+      - "src/career/autopilot/orchestrator.mjs (改: forced pass — 队列 job 绕过分数阈值 + drain stale/attempted)"
+      - "server.mjs (POST /autopilot/enqueue + GET /autopilot/queue)"
+      - "src/career/find-jobs/FindJobs.tsx (重构: Sources→状态条, Filters→左栏, machineMap 轮询, Apply→enqueue)"
+      - "src/career/find-jobs/JobCard.tsx (MachineAction 按状态: 让机器投/已排队/填表中/待提交/需接管) + find-jobs.css (两栏布局)"
+      - "scripts/smoke-jobs-downgrade.mjs (4) + smoke-autopilot-orchestrator.mjs (+2 forced tests → 32)"
+    actual_lines: 540
+    review_findings:
+      - "[HIGH] forced job 返回 BUSY 仍被 dequeue → 用户'让机器投'请求丢失 → 修:BUSY 不计入 attemptedForced,保留队列下轮重试"
+      - "[MEDIUM] 队列里不在 pipeline / 已投 / 非 solved-ATS 的 jobId 永不出队 → 泄漏 + 卡片永久'已排队' → 修:drainable 立即出队(覆盖 no-candidate 早返回路径)"
+      - "[MEDIUM] enqueue 无大小上限 → 修:QUEUE_CAP=200 FIFO drop-oldest"
+      - "[MEDIUM] startApply 后立即 fetchMachineMap 会和队列写竞争、把乐观'已排队'刷掉 → 修:去掉立即 refetch,靠 30s 轮询确认"
+      - "[LOW] machineMap 轮询无 unmount/abort 守卫 → 修:machineMounted ref + AbortController"
+      - "[LOW] review group 元素无 jobId 时污染 map[undefined] → 修:if(it?.jobId) 守卫"
+      - "[verified] forced 不超 cap、不与 byScore 重复;forced 仍守 solved-ATS+永不重投;RMW 串行化原子;JobCard 5 态正确(session 覆盖 queued)"
+      - "[NOTE] '让机器投'=入队走 daemon forced pass(绕过阈值,仍守其他铁律 + cap);Autopilot ON 时下个 tick 填,结果进 Review。深度操作仍走 Apply 页。"
     estimated_files:
       - "src/career/find-jobs/FindJobs.tsx"
       - "src/career/find-jobs/find-jobs.css"
@@ -191,8 +208,13 @@ commits:
     message: "[04-career-system/11-autopilot-ui-reframe] m2: Review human-gate queue + nav badge + answer-banking flywheel (smoke 4)"
     milestones_affected:
       - "m2-review-gate-queue (→ completed)"
+  - hash: "TBD-UI-M3"
+    date: "2026-06-22"
+    message: "[04-career-system/11-autopilot-ui-reframe] m3: Jobs page downgrade — Sources→bar, Filters→rail, Apply→让机器投 (forced-pass queue) (smoke 4+32)"
+    milestones_affected:
+      - "m3-jobs-page-downgrade (→ completed)"
 
 current_sprint: "Autopilot UI Reframe (C 方案 UI)"
 blockers: []
-status_note: "🚧 IN PROGRESS (2/4) — m1+m2 done. m2: Review inbox (3 buckets 待提交/需接管/填表中 from new GET /autopilot/review) + nav Review tab with polled badge + 'bank an answer' flywheel (POST /autopilot/bank-answer writes the applier-shape history the draft reader actually consumes). Key fix: persisted terminal_outcome+escalation_code on the session (schema +2 fields, machine writes on settle) so bucketing is restart-safe and the review endpoint no longer needs per-session getStatus. Deep per-field actions stay on the existing Apply page; Review routes there. Review (Plan agent): 1 HIGH (restart mis-bucket) + 3 LOW fixed; flywheel write-shape verified; apply-sessions-store 58/58 regression. 4/4 review smoke + vite build + lint. Next: m3 Jobs downgrade.\n\n(m1 done. Global AutopilotToggle in the Career header (poll /autopilot/status, optimistic ON/OFF) + new Dashboard landing page (status card + 4 funnel cards 候选/填表中/待批准/已提交 from /autopilot/feed + activity stream of per-candidate outcomes). Dashboard is the new landing tab (RootRedirect→dashboard, first nav tab). Consumes 10-autopilot-engine endpoints — engine room is COMPLETE so this is live, not stubbed. Review (Plan agent): 2 MEDIUM (unmounted setState; stale rollback) + 1 LOW (frozen spinner icon) fixed; no critical/high; redirect loop-safe. 5/5 dashboard smoke + vite build clean + lint. (tsc -b has pre-existing Apply.tsx errors, not ours.) Next: m2 Review gate queue. 详见 ../UI-LAYOUT.md。"
+status_note: "🚧 IN PROGRESS (3/4) — m1+m2+m3 done. m3 reframes the Find Jobs page the owner called 'ugly': Sources accordion → one-line status bar (Scan now + Manage→Profile), Filters accordion → always-on left rail, candidates grid = main column. Apply → '让机器投' which enqueues the job for the daemon's FORCED pass (autopilotQueue.mjs + orchestrator forced selection: bypasses the score threshold but still obeys solved-ATS / never-reapply / daily-cap). JobCard shows machine state (让机器投/已排队/填表中/待提交/需接管) from a polled review+queue map. Review (Plan agent): 1 HIGH (BUSY forced job dropped) + 4 MEDIUM/LOW fixed; forced-pass invariants verified; orchestrator 32/32 + jobs 4/4 smoke + vite build. Next: m4 nav reframe + Profile reclass + ROOM COMPLETE.\n\n(m1+m2 done. m2: Review inbox (3 buckets 待提交/需接管/填表中 from new GET /autopilot/review) + nav Review tab with polled badge + 'bank an answer' flywheel (POST /autopilot/bank-answer writes the applier-shape history the draft reader actually consumes). Key fix: persisted terminal_outcome+escalation_code on the session (schema +2 fields, machine writes on settle) so bucketing is restart-safe and the review endpoint no longer needs per-session getStatus. Deep per-field actions stay on the existing Apply page; Review routes there. Review (Plan agent): 1 HIGH (restart mis-bucket) + 3 LOW fixed; flywheel write-shape verified; apply-sessions-store 58/58 regression. 4/4 review smoke + vite build + lint. Next: m3 Jobs downgrade.\n\n(m1 done. Global AutopilotToggle in the Career header (poll /autopilot/status, optimistic ON/OFF) + new Dashboard landing page (status card + 4 funnel cards 候选/填表中/待批准/已提交 from /autopilot/feed + activity stream of per-candidate outcomes). Dashboard is the new landing tab (RootRedirect→dashboard, first nav tab). Consumes 10-autopilot-engine endpoints — engine room is COMPLETE so this is live, not stubbed. Review (Plan agent): 2 MEDIUM (unmounted setState; stale rollback) + 1 LOW (frozen spinner icon) fixed; no critical/high; redirect loop-safe. 5/5 dashboard smoke + vite build clean + lint. (tsc -b has pre-existing Apply.tsx errors, not ours.) Next: m2 Review gate queue. 详见 ../UI-LAYOUT.md。"
 last_updated: "2026-06-22"

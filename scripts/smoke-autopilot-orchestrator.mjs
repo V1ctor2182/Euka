@@ -221,6 +221,8 @@ function tickDeps(overrides = {}) {
       return { outcome: overrides.fillOutcome ?? 'parked', jobId: cand.id, escalationCode: overrides.fillEscalationCode ?? null };
     },
     _emit: (e) => { emitted.push(e); },
+    _readQueue: async () => overrides.queue ?? [],
+    _dequeue: async () => {},
     _now: () => overrides.now ?? Date.now(),
   };
   return { deps, filled, emitted, getState: () => state };
@@ -238,6 +240,8 @@ function mergedFrom(t) {
     isPipelineBusy: t.deps._isPipelineBusy,
     fill: t.deps._fill,
     emit: t.deps._emit,
+    readQueue: t.deps._readQueue,
+    dequeue: t.deps._dequeue,
     now: t.deps._now,
   };
 }
@@ -392,6 +396,36 @@ await test('tick-9g. emits one activity event per candidate with its outcome', a
   assert.deepEqual(t.emitted.map((e) => e.type).sort(), ['parked', 'parked']);
   assert.ok(t.emitted.every((e) => e.jobId && e.ats === 'greenhouse'));
 });
+
+await test('tick-9h. forced pass: manually-queued low-score job bypasses threshold', async () => {
+  // threshold 5, job scores 2 → normally excluded; but it's in the manual queue.
+  const t = tickDeps({
+    jobs: [job('aaaaaaaaaaaa', { score: 2 }), job('bbbbbbbbbbbb', { score: 9 })],
+    queue: ['aaaaaaaaaaaa'],
+  })
+  const merged = mergedFrom(t)
+  merged.readState = async () => ({ ...DEFAULT_STATE, enabled: true, daily_cap: 5, daily_count: 0, daily_count_date: dayKey() })
+  // raise threshold so only the forced job + high scorer qualify
+  merged.readState = async () => ({ ...DEFAULT_STATE, enabled: true, daily_cap: 5, daily_count: 0, daily_count_date: dayKey(), score_threshold: 5 })
+  const r = await _tick(merged)
+  const ids = t.filled.map((c) => c.id)
+  assert.ok(ids.includes('aaaaaaaaaaaa'), 'forced low-score job filled')
+  assert.ok(ids.includes('bbbbbbbbbbbb'), 'high-score job also filled')
+  // forced job marked
+  assert.ok(r.picked.find((c) => c.id === 'aaaaaaaaaaaa')?.forced, 'forced flag set')
+})
+
+await test('tick-9i. forced job already applied is NOT re-picked', async () => {
+  const t = tickDeps({
+    jobs: [job('aaaaaaaaaaaa', { score: 2 })],
+    queue: ['aaaaaaaaaaaa'],
+    apps: [{ id: 'aaaaaaaaaaaa-20260101', status: 'Applied' }],
+  })
+  const merged = mergedFrom(t)
+  merged.readState = async () => ({ ...DEFAULT_STATE, enabled: true, daily_cap: 5, daily_count: 0, daily_count_date: dayKey(), score_threshold: 5 })
+  const r = await _tick(merged)
+  assert.equal(r.reason, 'no-candidates') // forced job excluded by rule 5
+})
 
 await test('tick-10. single-flight guard: overlapping tick no-ops (C1/C2)', async () => {
   // A slow fill keeps the first tick in-flight while we fire a second tick.

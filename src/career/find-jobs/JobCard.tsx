@@ -6,7 +6,10 @@
 //   - kind='passed':  show score pill + [View] / [Apply]
 //   - kind='dropped': show DROPPED badge + dropped_by reason + [Adjust filter]
 
-import { ExternalLink, Eye, Send, AlertTriangle, Filter } from 'lucide-react'
+import { ExternalLink, Eye, Bot, AlertTriangle, Filter, Loader2, Inbox, Check } from 'lucide-react'
+
+// What the autopilot machine is doing with this job (null = untouched).
+export type MachineState = 'queued' | 'filling' | 'submit' | 'failed' | null
 
 export type JobCardModel = {
   id: string
@@ -29,11 +32,13 @@ export type JobCardModel = {
 type Props = {
   job: JobCardModel
   onView?: (job: JobCardModel) => void
-  onApply?: (job: JobCardModel) => void
+  onApply?: (job: JobCardModel) => void  // "让机器投" — enqueue for the daemon
   onAdjustFilter?: (job: JobCardModel) => void
+  machineState?: MachineState
+  onOpenReview?: () => void
 }
 
-export default function JobCard({ job, onView, onApply, onAdjustFilter }: Props) {
+export default function JobCard({ job, onView, onApply, onAdjustFilter, machineState, onOpenReview }: Props) {
   const dropped = job._passed === false
   const score = job.evaluation?.stage_a?.score
   const tier =
@@ -99,11 +104,7 @@ export default function JobCard({ job, onView, onApply, onAdjustFilter }: Props)
               <Eye size={13} /> View
             </button>
           )}
-          {!dropped && onApply && (
-            <button type="button" className="c-fj-btn c-fj-btn-primary" onClick={() => onApply(job)}>
-              <Send size={13} /> Apply
-            </button>
-          )}
+          {!dropped && <MachineAction state={machineState ?? null} onApply={onApply ? () => onApply(job) : undefined} onOpenReview={onOpenReview} />}
           {dropped && onAdjustFilter && (
             <button
               type="button"
@@ -118,6 +119,28 @@ export default function JobCard({ job, onView, onApply, onAdjustFilter }: Props)
       </footer>
     </article>
   )
+}
+
+// The autopilot action button — reflects what the machine is doing with the job.
+function MachineAction({ state, onApply, onOpenReview }: { state: MachineState; onApply?: () => void; onOpenReview?: () => void }) {
+  if (state === 'filling') {
+    return <span className="c-fj-btn c-fj-btn-state" title="机器正在填这个表"><Loader2 size={13} className="c-fj-spin" /> 填表中</span>
+  }
+  if (state === 'queued') {
+    return <span className="c-fj-btn c-fj-btn-state" title="已排队 — 打开 Autopilot 让机器投"><Inbox size={13} /> 已排队</span>
+  }
+  if (state === 'submit') {
+    return <button type="button" className="c-fj-btn c-fj-btn-primary" onClick={onOpenReview} title="已填好,去 Review 提交"><Check size={13} /> 待提交</button>
+  }
+  if (state === 'failed') {
+    return <button type="button" className="c-fj-btn c-fj-btn-ghost" onClick={onOpenReview} title="填表失败,去 Review 接管"><AlertTriangle size={13} /> 需接管</button>
+  }
+  // untouched → offer to hand it to the machine
+  return onApply ? (
+    <button type="button" className="c-fj-btn c-fj-btn-primary" onClick={onApply} title="让机器自动填这个表(停在 submit gate,不自动提交)">
+      <Bot size={13} /> 让机器投
+    </button>
+  ) : null
 }
 
 function ScoreDot({ tier }: { tier: 'good' | 'warn' | 'bad' | 'unrated' }) {

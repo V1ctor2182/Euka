@@ -57,6 +57,7 @@ import { startScheduler, stopScheduler } from './src/career/finder/scheduler.mjs
 import { startAutopilot, stopAutopilot, tickNow as autopilotTickNow, selectCandidates as autopilotSelectCandidates, readPipelineJobs as autopilotReadPipelineJobs, appliedJobIdSet as autopilotAppliedJobIdSet, readActiveSessionJobIds as autopilotReadActiveSessionJobIds } from './src/career/autopilot/orchestrator.mjs';
 import { readAutopilotState, patchAutopilotState, withDailyReset, HARD_DAILY_CAP, MAX_SCORE_THRESHOLD } from './src/career/autopilot/autopilotState.mjs';
 import { appendEvent as autopilotAppendEvent, readRecentFeed as autopilotReadRecentFeed, computeFunnel as autopilotComputeFunnel, compactFeed as autopilotCompactFeed } from './src/career/autopilot/feed.mjs';
+import { enqueue as autopilotEnqueue, readQueue as autopilotReadQueue } from './src/career/autopilot/autopilotQueue.mjs';
 
 // Wire the orchestrator's activity-feed sink to the real feed store. Kept here
 // (not in orchestrator.mjs) to avoid an import cycle (feed imports orchestrator).
@@ -3735,6 +3736,28 @@ app.get('/api/career/autopilot/feed', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// "让机器投" — manually queue a specific job for the daemon (11-au-ui m3).
+// The orchestrator's next tick fills queued jobs on a FORCED pass (bypasses the
+// score threshold) — but only actually runs when Autopilot is ON. Returns the
+// queue so the Jobs page can reflect "已排队" immediately.
+app.post('/api/career/autopilot/enqueue', async (req, res) => {
+  const jobId = req.body?.jobId;
+  if (typeof jobId !== 'string' || !/^[a-f0-9]{12}$/.test(jobId)) {
+    return res.status(400).json({ error: 'jobId must match 12-hex' });
+  }
+  try {
+    const queue = await autopilotEnqueue(jobId);
+    res.status(202).json({ queued: true, queue });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/career/autopilot/queue', async (_req, res) => {
+  try { res.json({ queue: await autopilotReadQueue() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── Review queue — the human-gate inbox (11-autopilot-ui-reframe m2) ───

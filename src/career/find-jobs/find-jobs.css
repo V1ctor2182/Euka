@@ -8,6 +8,55 @@
   margin: 0 auto;
 }
 
+/* m3 reframe: Sources → one-line status bar + two-column (filter rail | grid) */
+.c-fj-statusbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  margin-bottom: 16px;
+  background: #fafaf9;
+  border: 1px solid #e7e5e4;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.c-fj-statusbar-summary { color: #57534e; font-variant-numeric: tabular-nums; }
+.c-fj-statusbar .c-fj-search { margin: 0; max-width: 260px; }
+
+.c-fj-layout {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 20px;
+  align-items: start;
+}
+.c-fj-rail {
+  position: sticky;
+  top: 16px;
+  border: 1px solid #e5e5e5;
+  border-radius: 10px;
+  padding: 14px;
+  background: #fff;
+}
+.c-fj-rail-head { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.c-fj-rail-sub { font-size: 12px; color: #78716c; margin: 4px 0 10px; }
+.c-fj-rail-actions { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.c-fj-main { min-width: 0; }
+.c-fj-applymsg {
+  font-size: 13px; color: #166534; background: #f0fdf4;
+  border: 1px solid #bbf7d0; border-radius: 6px; padding: 8px 12px; margin: 0 0 12px;
+}
+
+/* machine-state action chip (let the daemon do it) */
+.c-fj-btn-state {
+  display: inline-flex; align-items: center; gap: 5px;
+  color: #78716c; background: #f5f5f4; cursor: default;
+}
+
+@media (max-width: 860px) {
+  .c-fj-layout { grid-template-columns: 1fr; }
+  .c-fj-rail { position: static; }
+}
+
 .c-fj-header {
   margin-bottom: 20px;
 }
@@ -96,6 +145,10 @@
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: 12px;
 }
+/* In the narrow left rail, stack filter fields single-column. */
+.c-fj-rail .c-fj-filter-grid { grid-template-columns: 1fr; }
+.c-fj-rail .c-fj-filter-body { padding: 0; }
+.c-fj-rail .c-fj-filter-foot { flex-direction: column; align-items: stretch; gap: 8px; }
 
 .c-fj-filter-field {
   background: #ffffff;
