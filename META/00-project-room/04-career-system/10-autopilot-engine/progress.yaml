@@ -187,7 +187,7 @@ commits:
     milestones_affected:
       - "m1-orchestrator-tick-and-lifecycle (→ completed)"
 
-  - hash: "TBD2"
+  - hash: "da6bd81"
     date: "2026-06-22"
     message: "[04-career-system/10-autopilot-engine] m2: per-candidate fill driver (drives multistep machine to submit gate, never submits) (smoke 16+29)"
     milestones_affected:
