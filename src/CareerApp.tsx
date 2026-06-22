@@ -4,6 +4,7 @@ import { ArrowLeft, Briefcase } from 'lucide-react'
 import CareerNav from './career/CareerNav'
 import AutopilotToggle from './career/AutopilotToggle'
 import Dashboard from './career/Dashboard'
+import Review from './career/Review'
 import Overview from './career/Overview'
 import Pipeline from './career/Pipeline'
 import Shortlist from './career/Shortlist'
@@ -31,7 +32,7 @@ import Integrations from './career/settings/Integrations'
 import './career.css'
 
 const LAST_TAB_KEY = 'career-last-tab'
-const VALID_TABS = ['dashboard', 'find-jobs', 'overview', 'pipeline', 'shortlist', 'applied', 'prep', 'learning', 'iteration', 'reports', 'settings']
+const VALID_TABS = ['dashboard', 'review', 'find-jobs', 'overview', 'pipeline', 'shortlist', 'applied', 'prep', 'learning', 'iteration', 'reports', 'settings']
 
 // localStorage can throw in Safari private mode, when over quota, or when
 // disabled by extension. Don't crash the app boot for a UX nicety.
@@ -85,6 +86,7 @@ export default function CareerApp() {
         <Routes>
           <Route index element={<RootRedirect />} />
           <Route path="dashboard" element={<Dashboard />} />
+          <Route path="review" element={<Review />} />
           <Route path="find-jobs" element={<FindJobs />} />
           <Route path="overview" element={<Overview />} />
           <Route path="pipeline" element={<Pipeline />} />

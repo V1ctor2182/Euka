@@ -1273,6 +1273,13 @@ export async function runMachine(args, deps = {}) {
   }
   // (PAUSED was already set by runStep on declined approval)
 
+  // 11-autopilot-ui-reframe m2: persist the terminal outcome + escalation code
+  // so the Review queue buckets correctly after a restart (in-memory machine +
+  // its escalation_reason are gone then). ready_for_submit → submit bucket;
+  // error/submit_failed/etc → failed bucket; declined-approval PAUSED → submit.
+  session.terminal_outcome = outcome;
+  session.escalation_code = loopOutcomeMeta?.escalation_reason?.code ?? null;
+
   // H6 fix from review: wrap the final write so ZodError (e.g. field_memory
   // ballooned past cap) becomes a clean error outcome rather than
   // escaping runMachine as an uncaught rejection.

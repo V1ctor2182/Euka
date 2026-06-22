@@ -90,6 +90,21 @@
   background: #fafafa;
 }
 
+.c-nav-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #f59e0b;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
 .c-nav-tab-active {
   color: #0a0a0a;
   border-bottom-color: #0a0a0a;

@@ -22,10 +22,10 @@
 3. **Jobs 页降级** — Sources→状态条、Filters→左栏、Apply→"加入投递队列"(真入队到编排器)。
 4. **导航重排 + Profile 归类** — Dashboard/Review/Jobs/Tracker/Profile;删 legacy;debug 收进 Dev/Debug。
 
-## 当前进度 — 🚧 IN PROGRESS (1/4)
+## 当前进度 — 🚧 IN PROGRESS (2/4)
 
-- ✅ **m1-global-control-bar-and-dashboard** — 顶栏全局 `AutopilotToggle`(poll `/autopilot/status`,乐观 ON/OFF)+ 新 `Dashboard` 落地页(状态卡 + 4 漏斗卡 候选/填表中/待批准/已提交,读 `/autopilot/feed` + 活动流)。Dashboard 设为落地 tab。消费 `10-autopilot-engine`(已 COMPLETE,真数据)。Review:2M+1L 全修,redirect 无环;5/5 smoke + vite build + lint。
-- ⬜ m2-review-gate-queue
+- ✅ **m1-global-control-bar-and-dashboard** — 顶栏全局 `AutopilotToggle` + 新 `Dashboard` 落地页(状态卡 + 4 漏斗 + 活动流,读 `/autopilot/status`+`/feed`)。5/5 smoke。
+- ✅ **m2-review-gate-queue** — Review 人工闸门收件箱(3 桶 待提交/需接管/填表中,新 `GET /autopilot/review`)+ nav Review tab + 轮询 badge + "存答案"飞轮(`POST /autopilot/bank-answer` 写 applier-shape history)。关键修复:把 `terminal_outcome`+`escalation_code` 持久化进 session(schema +2 字段,machine settle 时写)→ 分桶重启安全、不再每 session 调 getStatus。深度逐字段操作仍走现有 Apply 页。Review:1H+3L 全修;飞轮写形态已核;apply-sessions-store 58/58 回归;4/4 smoke。
 - ⬜ m3-jobs-page-downgrade
 - ⬜ m4-nav-reframe-profile-reclass-room-complete
 

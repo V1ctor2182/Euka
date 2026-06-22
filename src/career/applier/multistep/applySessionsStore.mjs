@@ -259,6 +259,12 @@ export const ApplySessionSchema = z
         { message: `user_hints cap is ${MAX_USER_HINTS} entries` },
       )
       .default([]),
+    // 11-autopilot-ui-reframe m2: terminal outcome + escalation code persisted
+    // on settle so the Review queue can bucket the session correctly AFTER a
+    // restart (when the in-memory machine + its escalation_reason are gone).
+    // Optional so pre-m2 sessions load without migration.
+    terminal_outcome: z.string().max(40).optional(),
+    escalation_code: z.string().max(80).nullable().optional(),
   })
   .strict()
   // L3 fix from review: current_step <= total_steps invariant when known

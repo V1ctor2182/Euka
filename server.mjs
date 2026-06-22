@@ -131,7 +131,7 @@ import {
 } from './src/career/applier/multistep/endpoint.mjs';
 // m9: SSE event hub — broadcast observer/state events to the Apply.tsx UI.
 import { subscribe as sseSubscribe, broadcast as sseBroadcast } from './src/career/applier/multistep/sseHub.mjs';
-import { JOB_ID_RE as APPLY_SESSIONS_JOB_ID_RE } from './src/career/applier/multistep/applySessionsStore.mjs';
+import { JOB_ID_RE as APPLY_SESSIONS_JOB_ID_RE, APPLY_SESSIONS_DIR, readSession as readApplySession } from './src/career/applier/multistep/applySessionsStore.mjs';
 // 07-applier/07-self-iteration/02-data-flywheel m3 — approve/reject seam
 // for Haiku-induced proposals. Importing this module runs its top-level
 // await of ensureLearnedRulesLoaded, which wires user-approved classifier
@@ -3732,6 +3732,118 @@ app.get('/api/career/autopilot/feed', async (req, res) => {
       autopilotComputeFunnel(),
     ]);
     res.json({ events, funnel });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Review queue — the human-gate inbox (11-autopilot-ui-reframe m2) ───
+// Lists apply-sessions grouped into buckets the Review page renders:
+//   submit  — status 'paused': the machine filled what it safely could and is
+//             waiting for you (submit it, or answer a question it couldn't fill)
+//   failed  — status 'abandoned': stale / timed out, needs manual takeover
+//   filling — status 'active': a fill is in progress (informational)
+// Joins pipeline.json for company/role, and enriches with the in-memory
+// machine's escalation code when the session is still resident (lost on restart,
+// so it's a best-effort hint, not the bucket key).
+// Escalation codes (+ terminal ERROR) that mean the session FAILED and needs
+// manual takeover, vs ready_for_submit / a declined-approval pause that just
+// awaits your Submit. login_wall/captcha are forward-looking (not emitted by the
+// 3 in-scope ATSs yet). Read from session.escalation_code (persisted on disk),
+// so bucketing is correct after a restart — not the in-memory machine.
+const REVIEW_FAILURE_CODES = new Set(['login_wall', 'captcha', 'login_required', 'submit_failed', 'hard_cap', 'wait_loop_stuck', 'parse_failure_empty', 'unexpected_next_step', 'timeout']);
+
+app.get('/api/career/autopilot/review', async (_req, res) => {
+  try {
+    const groups = { submit: [], failed: [], filling: [] };
+    let sessionIds = [];
+    if (existsSync(APPLY_SESSIONS_DIR)) {
+      sessionIds = (await fs.readdir(APPLY_SESSIONS_DIR))
+        .filter((f) => f.endsWith('.json'))
+        .map((f) => f.replace(/\.json$/, ''))
+        .filter((id) => APPLY_SESSIONS_JOB_ID_RE.test(id));
+    }
+    // Pipeline lookup for company/role.
+    const jobs = await autopilotReadPipelineJobs();
+    const jobById = new Map(jobs.map((j) => [j.id, j]));
+
+    const items = await Promise.all(sessionIds.map(async (jobId) => {
+      const session = await readApplySession(jobId).catch(() => null);
+      if (!session) return null;
+      const filledCount = Object.values(session.per_step_status || {}).filter((s) => s === 'filled' || s === 'approved').length;
+      const job = jobById.get(jobId);
+      return {
+        jobId,
+        company: job?.company ?? null,
+        role: job?.role ?? null,
+        ats: session.site_adapter ?? null,
+        job_url: session.job_url ?? job?.url ?? null,
+        status: session.status,
+        filledCount,
+        // Persisted on settle (restart-safe). null for pre-m2 / in-flight.
+        escalationCode: session.escalation_code ?? null,
+        terminalOutcome: session.terminal_outcome ?? null,
+        last_activity_at: session.last_activity_at ?? null,
+      };
+    }));
+
+    for (const it of items.filter(Boolean)) {
+      const failed = it.status === 'abandoned'
+        || it.terminalOutcome === 'error'
+        || REVIEW_FAILURE_CODES.has(it.escalationCode);
+      if (it.status === 'active') groups.filling.push(it);
+      else if (failed) groups.failed.push(it);
+      else if (it.status === 'paused') groups.submit.push(it);
+      // 'completed' sessions are done (submitted/closed) — not shown.
+    }
+    // Newest activity first within each bucket.
+    for (const g of Object.values(groups)) {
+      g.sort((a, b) => String(b.last_activity_at).localeCompare(String(a.last_activity_at)));
+    }
+    res.json({
+      groups,
+      counts: { submit: groups.submit.length, failed: groups.failed.length, filling: groups.filling.length },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Bank a single Q&A answer from the Review page — the flywheel: an answer the
+// machine couldn't auto-fill, recorded so the NEXT run finds it. CRITICAL: must
+// write the APPLIER shape {label, final_answer, class} because that's what the
+// applier's history reader (draftPrompt.formatHistoryEntry) recognizes — the
+// Settings /qa-bank/history endpoint writes a different {field_type,q,a_final}
+// shape the applier does NOT read, so this is a distinct path on purpose.
+const BankAnswerBodySchema = z
+  .object({
+    label: z.string().min(1).max(200),
+    final_answer: z.string().min(1).max(2000),
+    jobId: z.string().regex(/^[a-f0-9]{12}$/).optional(),
+    class: z.enum(['hard', 'legal', 'open', 'file']).optional(),
+  })
+  .strict();
+
+app.post('/api/career/autopilot/bank-answer', async (req, res) => {
+  const parsed = BankAnswerBodySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
+  }
+  try {
+    const entry = {
+      ts: new Date().toISOString(),
+      jobId: parsed.data.jobId ?? null,
+      label: parsed.data.label,
+      final_answer: parsed.data.final_answer,
+      class: parsed.data.class ?? 'open',
+    };
+    const line = JSON.stringify(entry) + '\n';
+    if (Buffer.byteLength(line, 'utf8') > 4000) {
+      return res.status(400).json({ error: 'answer too long' });
+    }
+    if (!existsSync(QA_BANK_DIR)) await fs.mkdir(QA_BANK_DIR, { recursive: true });
+    await fs.appendFile(QA_HISTORY_FILE, line);
+    res.status(201).json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

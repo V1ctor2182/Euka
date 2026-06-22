@@ -1,0 +1,84 @@
+/* Review human-gate inbox — rv- prefix. 3 buckets of cards. */
+
+.rv-page { }
+.rv-sub { color: #78716c; font-size: 13px; margin: -4px 0 16px; }
+.rv-muted { color: #78716c; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+.rv-spin { animation: rv-spin 1s linear infinite; }
+@keyframes rv-spin { to { transform: rotate(360deg); } }
+
+.rv-error {
+  display: flex; align-items: center; gap: 6px;
+  color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca;
+  padding: 10px 14px; border-radius: 6px; font-size: 13px; margin: 8px 0;
+}
+
+.rv-empty {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 40px 20px; text-align: center; color: #57534e;
+}
+.rv-empty svg { color: #16a34a; }
+.rv-empty p { margin: 0; font-size: 13px; color: #78716c; }
+
+/* ── bucket ──────────────────────────────────────────────── */
+.rv-bucket { margin-bottom: 22px; }
+.rv-bucket-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.rv-bucket-head h3 { margin: 0; font-size: 15px; }
+.rv-count {
+  font-size: 12px; font-weight: 700; color: #57534e;
+  background: #f5f5f4; border-radius: 999px; padding: 1px 8px; margin-left: 2px;
+}
+.rv-bucket-hint { font-size: 12px; color: #a8a29e; }
+
+.rv-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+
+/* ── card ────────────────────────────────────────────────── */
+.rv-card {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+  padding: 12px 16px; border-radius: 10px; border: 1px solid #e5e5e5; background: #fff;
+}
+.rv-tone-ok .rv-card { border-left: 3px solid #16a34a; }
+.rv-tone-bad .rv-card { border-left: 3px solid #dc2626; }
+.rv-tone-muted .rv-card { border-left: 3px solid #d6d3d1; opacity: 0.85; }
+
+.rv-card-main { flex: 1; min-width: 200px; }
+.rv-card-title { font-weight: 600; font-size: 14px; }
+.rv-card-role { font-weight: 400; color: #78716c; }
+.rv-card-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; font-size: 12px; color: #78716c; }
+.rv-card-time { color: #a8a29e; }
+.rv-tag {
+  font-size: 11px; background: #f5f5f4; border-radius: 4px; padding: 1px 6px; color: #57534e;
+}
+.rv-tag-warn { background: #fef3c7; color: #92400e; }
+
+.rv-card-actions { display: flex; align-items: center; gap: 6px; }
+
+.rv-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 6px 11px; border-radius: 6px; font-size: 12px; font-weight: 600;
+  border: 1px solid #e5e5e5; background: #fff; color: #44403c; cursor: pointer; text-decoration: none;
+}
+.rv-btn:hover:not(:disabled) { background: #f5f5f4; }
+.rv-btn:disabled { opacity: 0.6; cursor: default; }
+.rv-btn-primary { background: #16a34a; border-color: #16a34a; color: #fff; }
+.rv-btn-primary:hover:not(:disabled) { background: #15803d; }
+.rv-btn-ghost { background: #fff; }
+
+/* ── bank answer mini-form ───────────────────────────────── */
+.rv-bank {
+  flex-basis: 100%; margin-top: 8px; padding: 12px;
+  background: #fafaf9; border: 1px solid #e7e5e4; border-radius: 8px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.rv-bank-label, .rv-bank-answer {
+  width: 100%; box-sizing: border-box; font: inherit; font-size: 13px;
+  padding: 7px 10px; border: 1px solid #d6d3d1; border-radius: 6px; resize: vertical;
+}
+.rv-bank-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.rv-bank-hint { font-size: 11px; color: #a8a29e; }
+.rv-bank-msg { margin: 0; font-size: 12px; }
+.rv-bank-msg-ok { color: #166534; }
+.rv-bank-msg-bad { color: #b91c1c; }
+
+@media (max-width: 640px) {
+  .rv-card-actions { width: 100%; }
+}

@@ -54,7 +54,24 @@ milestones:
 
   - id: "m2-review-gate-queue"
     name: "Review 人工闸门队列(待提交 / 待回答新问题 / 失败接管 + qa-bank 回写)"
-    status: pending
+    status: completed
+    actual_files:
+      - "src/career/Review.tsx (~230 行) + review.css"
+      - "server.mjs (GET /autopilot/review + POST /autopilot/bank-answer)"
+      - "src/career/applier/multistep/applySessionsStore.mjs (schema +terminal_outcome +escalation_code)"
+      - "src/career/applier/multistep/machine.mjs (settle 时持久化 terminal_outcome/escalation_code)"
+      - "src/career/CareerNav.tsx (Review tab + 轮询 badge) + src/career.css (.c-nav-badge)"
+      - "src/CareerApp.tsx (/review route) + scripts/smoke-review-queue.mjs (4 tests)"
+    actual_lines: 600
+    review_findings:
+      - "[DESIGN] session 磁盘上无 escalation_reason(仅内存),分桶会在重启后错判 → 修:把 terminal_outcome+escalation_code 持久化进 session(schema 加 2 个 optional 字段 + machine settle 时写),review 端点从磁盘读 → 重启安全"
+      - "[HIGH→fixed] 失败 session 重启后(无内存 machine)误归到绿色'待提交'(让用户去提交一个其实失败的表)→ terminal_outcome='error' 也归 failed"
+      - "[副作用 fixed] 持久化后 review 端点不再每 session 调 getStatus(去掉 2N 磁盘读 / 重启不一致)"
+      - "[飞轮 verified] bank-answer 必须写 applier-shape {label,final_answer,class}(draftPrompt.formatHistoryEntry 只认这个),不能用 Settings 的 {field_type,q,a_final} → 用独立 path /autopilot/bank-answer"
+      - "[LOW] REVIEW_FAILURE_CODES 漏了真实的 'timeout' 码 → 补上;login_wall/captcha 保留为登录墙 ATS 预留"
+      - "[LOW] BankAnswer save() 无 unmount 守卫 + setTimeout 泄漏 → 加 mountedRef + clearTimeout"
+      - "[NOTE] 深度逐字段操作仍走现有 Apply 页(/apply/:jobId);Review 是统一收件箱 + 一键直达 + 答案入库飞轮,不重复造"
+      - "[regression] apply-sessions-store smoke 58/58(schema 改动向后兼容)"
     estimated_files:
       - "src/career/Review.tsx"
       - "src/career/review.css"
@@ -169,8 +186,13 @@ commits:
     message: "[04-career-system/11-autopilot-ui-reframe] m1: global Autopilot toggle + Dashboard (status card + 4 funnel + activity stream) (smoke 5)"
     milestones_affected:
       - "m1-global-control-bar-and-dashboard (→ completed)"
+  - hash: "TBD-UI-M2"
+    date: "2026-06-22"
+    message: "[04-career-system/11-autopilot-ui-reframe] m2: Review human-gate queue + nav badge + answer-banking flywheel (smoke 4)"
+    milestones_affected:
+      - "m2-review-gate-queue (→ completed)"
 
 current_sprint: "Autopilot UI Reframe (C 方案 UI)"
 blockers: []
-status_note: "🚧 IN PROGRESS (1/4) — m1 done. Global AutopilotToggle in the Career header (poll /autopilot/status, optimistic ON/OFF) + new Dashboard landing page (status card + 4 funnel cards 候选/填表中/待批准/已提交 from /autopilot/feed + activity stream of per-candidate outcomes). Dashboard is the new landing tab (RootRedirect→dashboard, first nav tab). Consumes 10-autopilot-engine endpoints — engine room is COMPLETE so this is live, not stubbed. Review (Plan agent): 2 MEDIUM (unmounted setState; stale rollback) + 1 LOW (frozen spinner icon) fixed; no critical/high; redirect loop-safe. 5/5 dashboard smoke + vite build clean + lint. (tsc -b has pre-existing Apply.tsx errors, not ours.) Next: m2 Review gate queue. 详见 ../UI-LAYOUT.md。"
+status_note: "🚧 IN PROGRESS (2/4) — m1+m2 done. m2: Review inbox (3 buckets 待提交/需接管/填表中 from new GET /autopilot/review) + nav Review tab with polled badge + 'bank an answer' flywheel (POST /autopilot/bank-answer writes the applier-shape history the draft reader actually consumes). Key fix: persisted terminal_outcome+escalation_code on the session (schema +2 fields, machine writes on settle) so bucketing is restart-safe and the review endpoint no longer needs per-session getStatus. Deep per-field actions stay on the existing Apply page; Review routes there. Review (Plan agent): 1 HIGH (restart mis-bucket) + 3 LOW fixed; flywheel write-shape verified; apply-sessions-store 58/58 regression. 4/4 review smoke + vite build + lint. Next: m3 Jobs downgrade.\n\n(m1 done. Global AutopilotToggle in the Career header (poll /autopilot/status, optimistic ON/OFF) + new Dashboard landing page (status card + 4 funnel cards 候选/填表中/待批准/已提交 from /autopilot/feed + activity stream of per-candidate outcomes). Dashboard is the new landing tab (RootRedirect→dashboard, first nav tab). Consumes 10-autopilot-engine endpoints — engine room is COMPLETE so this is live, not stubbed. Review (Plan agent): 2 MEDIUM (unmounted setState; stale rollback) + 1 LOW (frozen spinner icon) fixed; no critical/high; redirect loop-safe. 5/5 dashboard smoke + vite build clean + lint. (tsc -b has pre-existing Apply.tsx errors, not ours.) Next: m2 Review gate queue. 详见 ../UI-LAYOUT.md。"
 last_updated: "2026-06-22"
