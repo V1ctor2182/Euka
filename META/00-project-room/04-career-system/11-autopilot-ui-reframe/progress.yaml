@@ -164,7 +164,7 @@ milestones:
       ROOM COMPLETE。
 
 commits:
-  - hash: "TBD-UI-M1"
+  - hash: "68d79fb"
     date: "2026-06-22"
     message: "[04-career-system/11-autopilot-ui-reframe] m1: global Autopilot toggle + Dashboard (status card + 4 funnel + activity stream) (smoke 5)"
     milestones_affected:
