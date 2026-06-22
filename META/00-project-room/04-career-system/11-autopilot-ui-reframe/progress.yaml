@@ -223,7 +223,7 @@ commits:
     message: "[04-career-system/11-autopilot-ui-reframe] m3: Jobs page downgrade — Sources→bar, Filters→rail, Apply→让机器投 (forced-pass queue) (smoke 4+32)"
     milestones_affected:
       - "m3-jobs-page-downgrade (→ completed)"
-  - hash: "TBD-UI-M4"
+  - hash: "2f4034b"
     date: "2026-06-23"
     message: "[04-career-system/11-autopilot-ui-reframe] m4: nav reframe (Dashboard/Review/Jobs/Tracker/Profile) + Profile reclass + legacy redirects + ROOM COMPLETE (smoke 4)"
     milestones_affected:
