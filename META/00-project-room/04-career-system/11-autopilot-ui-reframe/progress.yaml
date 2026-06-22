@@ -208,7 +208,7 @@ commits:
     message: "[04-career-system/11-autopilot-ui-reframe] m2: Review human-gate queue + nav badge + answer-banking flywheel (smoke 4)"
     milestones_affected:
       - "m2-review-gate-queue (→ completed)"
-  - hash: "TBD-UI-M3"
+  - hash: "00d1d62"
     date: "2026-06-22"
     message: "[04-career-system/11-autopilot-ui-reframe] m3: Jobs page downgrade — Sources→bar, Filters→rail, Apply→让机器投 (forced-pass queue) (smoke 4+32)"
     milestones_affected:
