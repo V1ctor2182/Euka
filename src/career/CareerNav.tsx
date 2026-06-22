@@ -7,38 +7,31 @@ import {
   Search,
   Send,
   User,
-  Settings,
   ChevronDown,
-  ListChecks,
-  Star,
+  MoreHorizontal,
   MessagesSquare,
-  TrendingDown,
-  Activity,
+  FileBarChart,
 } from 'lucide-react'
 
-// find-jobs-redesign m1.e: collapse the 8-tab developer-flavored nav
-// (Overview / Pipeline / Shortlist / Applied / Prep / Learning / Iteration / Settings)
-// into 3 user-flavored tabs + an Advanced overflow. Old tabs stay
-// accessible from Advanced so existing bookmarks don't 404.
-// autopilot-ui-reframe m1: Dashboard becomes the first/landing tab. The full nav
-// reframe (Review badge, Jobs/Tracker rename, debug→Profile) lands in m4.
+// autopilot-ui-reframe m4: the nav now mirrors the autopilot closed loop —
+// Dashboard (control) → Review (human gate) → Jobs (transparency) → Tracker
+// (results) → Profile (config). Legacy Overview/Pipeline/Shortlist are dropped
+// from the nav (their routes redirect to replacements so bookmarks don't 404);
+// the debug pages (Learning/Iteration) moved into Profile → Dev/Debug.
 const PRIMARY_TABS: Array<{ to: string; label: string; Icon: typeof LayoutDashboard; badgeKey?: string }> = [
   { to: '/career/dashboard', label: 'Dashboard', Icon: Gauge },
   { to: '/career/review', label: 'Review', Icon: Inbox, badgeKey: 'review' },
-  { to: '/career/find-jobs', label: 'Find Jobs', Icon: Search },
-  { to: '/career/applied', label: 'Apply & Track', Icon: Send },
+  { to: '/career/find-jobs', label: 'Jobs', Icon: Search },
+  { to: '/career/applied', label: 'Tracker', Icon: Send },
   { to: '/career/settings', label: 'Profile', Icon: User },
 ]
 
 const REVIEW_BADGE_REFRESH_MS = 30_000
 
+// "More" overflow — real-but-secondary user pages (not the daily loop).
 const ADVANCED_TABS: Array<{ to: string; label: string; Icon: typeof LayoutDashboard }> = [
-  { to: '/career/overview', label: 'Overview (legacy)', Icon: LayoutDashboard },
-  { to: '/career/pipeline', label: 'Pipeline (legacy)', Icon: ListChecks },
-  { to: '/career/shortlist', label: 'Shortlist (legacy)', Icon: Star },
   { to: '/career/prep', label: 'Interview Prep', Icon: MessagesSquare },
-  { to: '/career/learning', label: 'Learning (debug)', Icon: TrendingDown },
-  { to: '/career/iteration', label: 'Iteration (debug)', Icon: Activity },
+  { to: '/career/reports', label: 'Reports', Icon: FileBarChart },
 ]
 
 export default function CareerNav() {
@@ -87,8 +80,8 @@ export default function CareerNav() {
           onClick={() => setAdvancedOpen((o) => !o)}
           aria-expanded={advancedOpen}
         >
-          <Settings size={16} />
-          <span>Advanced</span>
+          <MoreHorizontal size={16} />
+          <span>More</span>
           <ChevronDown size={12} />
         </button>
         {advancedOpen && (

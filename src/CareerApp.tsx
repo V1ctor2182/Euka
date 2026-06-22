@@ -5,9 +5,6 @@ import CareerNav from './career/CareerNav'
 import AutopilotToggle from './career/AutopilotToggle'
 import Dashboard from './career/Dashboard'
 import Review from './career/Review'
-import Overview from './career/Overview'
-import Pipeline from './career/Pipeline'
-import Shortlist from './career/Shortlist'
 import NeedsManualEnrich from './career/shortlist/NeedsManualEnrich'
 import Applied from './career/Applied'
 import Prep from './career/Prep'
@@ -88,9 +85,12 @@ export default function CareerApp() {
           <Route path="dashboard" element={<Dashboard />} />
           <Route path="review" element={<Review />} />
           <Route path="find-jobs" element={<FindJobs />} />
-          <Route path="overview" element={<Overview />} />
-          <Route path="pipeline" element={<Pipeline />} />
-          <Route path="shortlist" element={<Shortlist />} />
+          {/* autopilot-ui-reframe m4: legacy pages removed from nav; redirect
+              their routes so old bookmarks don't 404. Overview→Dashboard,
+              Pipeline/Shortlist→Jobs. */}
+          <Route path="overview" element={<Navigate to="/career/dashboard" replace />} />
+          <Route path="pipeline" element={<Navigate to="/career/find-jobs" replace />} />
+          <Route path="shortlist" element={<Navigate to="/career/find-jobs" replace />} />
           <Route path="shortlist/needs-manual" element={<NeedsManualEnrich />} />
           <Route path="applied" element={<Applied />} />
           <Route path="prep" element={<Prep />} />
@@ -119,7 +119,7 @@ export default function CareerApp() {
             <Route path="*" element={<Navigate to="identity" replace />} />
           </Route>
           <Route path="settings/resumes/:id/edit" element={<ResumeEdit />} />
-          <Route path="*" element={<Navigate to="overview" replace />} />
+          <Route path="*" element={<Navigate to="dashboard" replace />} />
         </Routes>
       </main>
     </div>

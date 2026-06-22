@@ -159,7 +159,17 @@ milestones:
 
   - id: "m4-nav-reframe-profile-reclass-room-complete"
     name: "导航重排 + Profile 归类 + 删 legacy + ROOM COMPLETE"
-    status: pending
+    status: completed
+    actual_files:
+      - "src/career/CareerNav.tsx (主 tab → Dashboard/Review③/Jobs/Tracker/Profile;More=Prep+Reports;删 legacy)"
+      - "src/CareerApp.tsx (legacy /overview→dashboard /pipeline,/shortlist→find-jobs 重定向;catch-all→dashboard;删 3 个 legacy import)"
+      - "src/career/settings/SettingsLayout.tsx (分 3 组:机器怎么填/机器怎么找/集成&调试;Learning,Iteration 绝对链接收进 Dev)"
+      - "src/career.css (.c-settings-group + group-title)"
+      - "scripts/smoke-nav-reframe.mjs (4 结构断言)"
+    actual_lines: 200
+    review_findings:
+      - "[mechanical] 纯客户端路由/nav/settings 重排,无后端、无逻辑 → 按 dev-skill 跳过 agent review,用结构 smoke + lint + vite build 守护"
+      - "[verified] 5 主 tab 路由可达;legacy 路由 Navigate 重定向不 404;Overview/Pipeline/Shortlist import 已删;settings 3 分组 + debug 绝对链接;catch-all→dashboard"
     estimated_files:
       - "src/career/CareerNav.tsx"
       - "src/CareerApp.tsx"
@@ -213,8 +223,13 @@ commits:
     message: "[04-career-system/11-autopilot-ui-reframe] m3: Jobs page downgrade — Sources→bar, Filters→rail, Apply→让机器投 (forced-pass queue) (smoke 4+32)"
     milestones_affected:
       - "m3-jobs-page-downgrade (→ completed)"
+  - hash: "TBD-UI-M4"
+    date: "2026-06-23"
+    message: "[04-career-system/11-autopilot-ui-reframe] m4: nav reframe (Dashboard/Review/Jobs/Tracker/Profile) + Profile reclass + legacy redirects + ROOM COMPLETE (smoke 4)"
+    milestones_affected:
+      - "m4-nav-reframe-profile-reclass-room-complete (→ completed) — ROOM COMPLETE"
 
 current_sprint: "Autopilot UI Reframe (C 方案 UI)"
 blockers: []
-status_note: "🚧 IN PROGRESS (3/4) — m1+m2+m3 done. m3 reframes the Find Jobs page the owner called 'ugly': Sources accordion → one-line status bar (Scan now + Manage→Profile), Filters accordion → always-on left rail, candidates grid = main column. Apply → '让机器投' which enqueues the job for the daemon's FORCED pass (autopilotQueue.mjs + orchestrator forced selection: bypasses the score threshold but still obeys solved-ATS / never-reapply / daily-cap). JobCard shows machine state (让机器投/已排队/填表中/待提交/需接管) from a polled review+queue map. Review (Plan agent): 1 HIGH (BUSY forced job dropped) + 4 MEDIUM/LOW fixed; forced-pass invariants verified; orchestrator 32/32 + jobs 4/4 smoke + vite build. Next: m4 nav reframe + Profile reclass + ROOM COMPLETE.\n\n(m1+m2 done. m2: Review inbox (3 buckets 待提交/需接管/填表中 from new GET /autopilot/review) + nav Review tab with polled badge + 'bank an answer' flywheel (POST /autopilot/bank-answer writes the applier-shape history the draft reader actually consumes). Key fix: persisted terminal_outcome+escalation_code on the session (schema +2 fields, machine writes on settle) so bucketing is restart-safe and the review endpoint no longer needs per-session getStatus. Deep per-field actions stay on the existing Apply page; Review routes there. Review (Plan agent): 1 HIGH (restart mis-bucket) + 3 LOW fixed; flywheel write-shape verified; apply-sessions-store 58/58 regression. 4/4 review smoke + vite build + lint. Next: m3 Jobs downgrade.\n\n(m1 done. Global AutopilotToggle in the Career header (poll /autopilot/status, optimistic ON/OFF) + new Dashboard landing page (status card + 4 funnel cards 候选/填表中/待批准/已提交 from /autopilot/feed + activity stream of per-candidate outcomes). Dashboard is the new landing tab (RootRedirect→dashboard, first nav tab). Consumes 10-autopilot-engine endpoints — engine room is COMPLETE so this is live, not stubbed. Review (Plan agent): 2 MEDIUM (unmounted setState; stale rollback) + 1 LOW (frozen spinner icon) fixed; no critical/high; redirect loop-safe. 5/5 dashboard smoke + vite build clean + lint. (tsc -b has pre-existing Apply.tsx errors, not ours.) Next: m2 Review gate queue. 详见 ../UI-LAYOUT.md。"
+status_note: "🎉 ROOM COMPLETE (4/4, 100%). The manual job-browsing UI is now autopilot-first end to end. m4: main nav = the closed loop Dashboard → Review③ → Jobs → Tracker → Profile (Find Jobs→Jobs, Apply&Track→Tracker renamed); legacy Overview/Pipeline/Shortlist dropped from nav and their routes redirect (no 404); debug pages (Learning/Iteration) moved into Profile → 集成&调试; Profile sidebar grouped into 机器怎么填 / 机器怎么找 / 集成&调试. 4/4 nav smoke + vite build + lint. Whole epic shipped: global Autopilot toggle + Dashboard (m1) + Review human-gate queue (m2) + Jobs downgrade with 让机器投 queue (m3) + nav/Profile reframe (m4), consuming the 10-autopilot-engine daemon. See ../UI-LAYOUT.md.\n\n(m1+m2+m3 done. m3 reframes the Find Jobs page the owner called 'ugly': Sources accordion → one-line status bar (Scan now + Manage→Profile), Filters accordion → always-on left rail, candidates grid = main column. Apply → '让机器投' which enqueues the job for the daemon's FORCED pass (autopilotQueue.mjs + orchestrator forced selection: bypasses the score threshold but still obeys solved-ATS / never-reapply / daily-cap). JobCard shows machine state (让机器投/已排队/填表中/待提交/需接管) from a polled review+queue map. Review (Plan agent): 1 HIGH (BUSY forced job dropped) + 4 MEDIUM/LOW fixed; forced-pass invariants verified; orchestrator 32/32 + jobs 4/4 smoke + vite build. Next: m4 nav reframe + Profile reclass + ROOM COMPLETE.\n\n(m1+m2 done. m2: Review inbox (3 buckets 待提交/需接管/填表中 from new GET /autopilot/review) + nav Review tab with polled badge + 'bank an answer' flywheel (POST /autopilot/bank-answer writes the applier-shape history the draft reader actually consumes). Key fix: persisted terminal_outcome+escalation_code on the session (schema +2 fields, machine writes on settle) so bucketing is restart-safe and the review endpoint no longer needs per-session getStatus. Deep per-field actions stay on the existing Apply page; Review routes there. Review (Plan agent): 1 HIGH (restart mis-bucket) + 3 LOW fixed; flywheel write-shape verified; apply-sessions-store 58/58 regression. 4/4 review smoke + vite build + lint. Next: m3 Jobs downgrade.\n\n(m1 done. Global AutopilotToggle in the Career header (poll /autopilot/status, optimistic ON/OFF) + new Dashboard landing page (status card + 4 funnel cards 候选/填表中/待批准/已提交 from /autopilot/feed + activity stream of per-candidate outcomes). Dashboard is the new landing tab (RootRedirect→dashboard, first nav tab). Consumes 10-autopilot-engine endpoints — engine room is COMPLETE so this is live, not stubbed. Review (Plan agent): 2 MEDIUM (unmounted setState; stale rollback) + 1 LOW (frozen spinner icon) fixed; no critical/high; redirect loop-safe. 5/5 dashboard smoke + vite build clean + lint. (tsc -b has pre-existing Apply.tsx errors, not ours.) Next: m2 Review gate queue. 详见 ../UI-LAYOUT.md。"
 last_updated: "2026-06-22"

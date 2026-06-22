@@ -22,11 +22,13 @@
 3. **Jobs 页降级** — Sources→状态条、Filters→左栏、Apply→"加入投递队列"(真入队到编排器)。
 4. **导航重排 + Profile 归类** — Dashboard/Review/Jobs/Tracker/Profile;删 legacy;debug 收进 Dev/Debug。
 
-## 当前进度 — 🚧 IN PROGRESS (2/4)
+## 当前进度 — 🎉 ROOM COMPLETE (4/4, 100%)
 
 - ✅ **m1-global-control-bar-and-dashboard** — 顶栏全局 `AutopilotToggle` + 新 `Dashboard` 落地页(状态卡 + 4 漏斗 + 活动流,读 `/autopilot/status`+`/feed`)。5/5 smoke。
 - ✅ **m2-review-gate-queue** — Review 人工闸门收件箱(3 桶 待提交/需接管/填表中,新 `GET /autopilot/review`)+ nav Review tab + 轮询 badge + "存答案"飞轮(`POST /autopilot/bank-answer` 写 applier-shape history)。关键修复:把 `terminal_outcome`+`escalation_code` 持久化进 session(schema +2 字段,machine settle 时写)→ 分桶重启安全、不再每 session 调 getStatus。深度逐字段操作仍走现有 Apply 页。Review:1H+3L 全修;飞轮写形态已核;apply-sessions-store 58/58 回归;4/4 smoke。
 - ✅ **m3-jobs-page-downgrade** — 重构 Find Jobs:Sources 折叠区 → 一行状态条(Scan now + Manage→Profile),Filters 折叠区 → 常驻左栏,候选网格为右侧主体。Apply → **「让机器投」**(`autopilotQueue.mjs` + orchestrator forced pass:入队 job 绕过分数阈值,仍守 solved-ATS/永不重投/cap)。JobCard 按机器状态显示(让机器投/已排队/填表中/待提交/需接管,轮询 review+queue)。Review:1H+4M/L 全修;forced 不变量已核;orchestrator 32/32 + jobs 4/4。
-- ⬜ m4-nav-reframe-profile-reclass-room-complete
+- ✅ **m4-nav-reframe-profile-reclass-room-complete** — 主导航重排成 autopilot 闭环 Dashboard → Review③ → Jobs → Tracker → Profile;legacy(Overview/Pipeline/Shortlist)移出导航 + 路由重定向不 404;debug(Learning/Iteration)收进 Profile → 集成&调试;Profile 侧栏分 3 组(机器怎么填/机器怎么找/集成&调试)。4/4 nav smoke + vite build。
+
+🎉 **ROOM COMPLETE** — 手动浏览式 UI 已彻底重构为自动化优先,消费 `10-autopilot-engine` daemon:全局 Autopilot 开关 + Dashboard(m1)+ Review 人工闸门(m2)+ Jobs 降级带「让机器投」队列(m3)+ 导航/Profile 重排(m4)。
 
 milestones 见 `progress.yaml`。`10-autopilot-engine` 端点已就绪(真数据,非 stub)。
