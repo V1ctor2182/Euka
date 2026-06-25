@@ -205,7 +205,7 @@ export default function BudgetBanner() {
         <div className="bg-banner-text">
           <strong>今日 Sonnet+Tailor 预算 ${budget.toFixed(2)} 用尽</strong>
           {' '}(已用 ${today.toFixed(4)}) — 明天继续，或{' '}
-          <Link to="/career/settings/preferences" className="bg-banner-link">
+          <Link to="/settings/preferences" className="bg-banner-link">
             Edit budget →
           </Link>
           {staleSuffix}
@@ -226,7 +226,7 @@ export default function BudgetBanner() {
         <div className="bg-banner-text">
           <strong>Sonnet 预算还剩 ${remaining.toFixed(2)}</strong>
           {' '}({pctUsed}% used of ${budget.toFixed(2)}) —{' '}
-          <Link to="/career/settings/preferences" className="bg-banner-link">
+          <Link to="/settings/preferences" className="bg-banner-link">
             Edit budget
           </Link>
           {staleSuffix}

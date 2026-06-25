@@ -196,7 +196,7 @@ export default function NeedsManualEnrich() {
 
 function BackLink() {
   return (
-    <Link to="/career/shortlist" className="nme-back">
+    <Link to="/shortlist" className="nme-back">
       <ArrowLeft size={14} /> Shortlist
     </Link>
   )

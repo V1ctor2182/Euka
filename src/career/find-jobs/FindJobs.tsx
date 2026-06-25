@@ -11,7 +11,7 @@
 // [View raw N→] in the Filters section opens RawJobsDrawer (m1.c).
 
 import { useEffect, useMemo, useState, useCallback, useRef } from 'react'
-import { RefreshCw, SlidersHorizontal, Eye } from 'lucide-react'
+import { RefreshCw, SlidersHorizontal, Eye, Save } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
 import JobCard, { type JobCardModel, type MachineState } from './JobCard'
 import RawJobsDrawer from './RawJobsDrawer'
@@ -310,7 +310,7 @@ export default function FindJobs() {
         >
           {scanning ? 'Scanning…' : 'Scan now'}
         </button>
-        <Link to="/career/settings/portals" className="c-fj-btn c-fj-btn-ghost">Manage sources</Link>
+        <Link to="/settings/portals" className="c-fj-btn c-fj-btn-ghost">Manage sources</Link>
         <span className="c-fj-section-spacer" />
         <input
           className="c-fj-search"
@@ -375,7 +375,7 @@ export default function FindJobs() {
           ) : pipeline.total === 0 ? (
             <div className="c-fj-empty">
               <strong>No jobs scanned yet.</strong>
-              <p>Configure sources in <Link to="/career/settings/portals">Settings → Portals</Link>, then click <em>Scan now</em>.</p>
+              <p>Configure sources in <Link to="/settings/portals">Settings → Portals</Link>, then click <em>Scan now</em>.</p>
             </div>
           ) : pipeline.filtered === 0 && search.trim() === '' ? (
             <div className="c-fj-empty">
@@ -396,7 +396,7 @@ export default function FindJobs() {
                     machineState={machineMap[job.id] ?? null}
                     onView={(j) => setDetailJob(j)}
                     onApply={startApply}
-                    onOpenReview={() => navigate('/career/review')}
+                    onOpenReview={() => navigate('/review')}
                   />
                 ))}
               </div>
@@ -602,7 +602,7 @@ function FilterEditor({
       <div className="c-fj-filter-foot">
         <p className="c-fj-muted">
           Need more options (location, company blocklist, jd_text)?{' '}
-          <Link to="/career/settings/preferences">Open full Preferences →</Link>
+          <Link to="/settings/preferences">Open full Preferences →</Link>
         </p>
         <button
           type="button"
@@ -610,7 +610,7 @@ function FilterEditor({
           disabled={!dirty || saving}
           onClick={onSave}
         >
-          <Send size={13} /> {saving ? 'Saving…' : dirty ? 'Save filters' : 'Saved'}
+          <Save size={13} /> {saving ? 'Saving…' : dirty ? 'Save filters' : 'Saved'}
         </button>
       </div>
     </div>

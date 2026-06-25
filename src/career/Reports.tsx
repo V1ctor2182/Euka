@@ -122,7 +122,7 @@ function ReportsList() {
       ) : data.results.length === 0 ? (
         <div className="rp-empty">
           No Stage B reports yet. Head to{' '}
-          <Link to="/career/pipeline" className="rp-link">/career/pipeline</Link>{' '}
+          <Link to="/pipeline" className="rp-link">/career/pipeline</Link>{' '}
           to run Stage B first.
         </div>
       ) : (
@@ -140,13 +140,13 @@ function ReportsList() {
               <tr
                 key={row.id}
                 className={`rp-row${row.status === 'error' ? ' rp-row-error' : ''}`}
-                onClick={() => navigate(`/career/reports/${row.id}`)}
+                onClick={() => navigate(`/reports/${row.id}`)}
                 role="link"
                 tabIndex={0}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault()
-                    navigate(`/career/reports/${row.id}`)
+                    navigate(`/reports/${row.id}`)
                   }
                 }}
               >
@@ -269,7 +269,7 @@ function ReportDetail({ jobId }: { jobId: string }) {
   }, [blocks])
 
   const handlePrint = () => window.print()
-  const handleOpenPipeline = () => navigate('/career/pipeline')
+  const handleOpenPipeline = () => navigate('/pipeline')
   const scrollToBlock = (letter: string) => {
     const el = document.getElementById(`block-${letter}`)
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -281,7 +281,7 @@ function ReportDetail({ jobId }: { jobId: string }) {
         <button
           type="button"
           className="rp-back"
-          onClick={() => navigate('/career/reports')}
+          onClick={() => navigate('/reports')}
         >
           <ArrowLeft size={14} /> All reports
         </button>
@@ -291,7 +291,7 @@ function ReportDetail({ jobId }: { jobId: string }) {
         </div>
         <p>
           The report may not exist yet, or the Stage B run errored.{' '}
-          <Link to="/career/pipeline" className="rp-link">
+          <Link to="/pipeline" className="rp-link">
             Re-run from Pipeline →
           </Link>
         </p>
@@ -305,7 +305,7 @@ function ReportDetail({ jobId }: { jobId: string }) {
         <button
           type="button"
           className="rp-back"
-          onClick={() => navigate('/career/reports')}
+          onClick={() => navigate('/reports')}
         >
           <ArrowLeft size={14} /> All reports
         </button>
@@ -324,7 +324,7 @@ function ReportDetail({ jobId }: { jobId: string }) {
         <button
           type="button"
           className="rp-back"
-          onClick={() => navigate('/career/reports')}
+          onClick={() => navigate('/reports')}
         >
           <ArrowLeft size={14} /> All reports
         </button>

@@ -19,19 +19,19 @@ import {
 // from the nav (their routes redirect to replacements so bookmarks don't 404);
 // the debug pages (Learning/Iteration) moved into Profile → Dev/Debug.
 const PRIMARY_TABS: Array<{ to: string; label: string; Icon: typeof LayoutDashboard; badgeKey?: string }> = [
-  { to: '/career/dashboard', label: 'Dashboard', Icon: Gauge },
-  { to: '/career/review', label: 'Review', Icon: Inbox, badgeKey: 'review' },
-  { to: '/career/find-jobs', label: 'Jobs', Icon: Search },
-  { to: '/career/applied', label: 'Tracker', Icon: Send },
-  { to: '/career/settings', label: 'Profile', Icon: User },
+  { to: '/dashboard', label: 'Dashboard', Icon: Gauge },
+  { to: '/review', label: 'Review', Icon: Inbox, badgeKey: 'review' },
+  { to: '/find-jobs', label: 'Jobs', Icon: Search },
+  { to: '/applied', label: 'Tracker', Icon: Send },
+  { to: '/settings', label: 'Profile', Icon: User },
 ]
 
 const REVIEW_BADGE_REFRESH_MS = 30_000
 
 // "More" overflow — real-but-secondary user pages (not the daily loop).
 const ADVANCED_TABS: Array<{ to: string; label: string; Icon: typeof LayoutDashboard }> = [
-  { to: '/career/prep', label: 'Interview Prep', Icon: MessagesSquare },
-  { to: '/career/reports', label: 'Reports', Icon: FileBarChart },
+  { to: '/prep', label: 'Interview Prep', Icon: MessagesSquare },
+  { to: '/reports', label: 'Reports', Icon: FileBarChart },
 ]
 
 export default function CareerNav() {

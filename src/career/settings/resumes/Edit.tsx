@@ -161,7 +161,7 @@ export default function ResumeEdit() {
   return (
     <div className="c-resume-edit-page">
       <div className="c-resume-edit-toolbar">
-        <Link to="/career/settings/resumes" className="c-resume-edit-back">
+        <Link to="/settings/resumes" className="c-resume-edit-back">
           <ArrowLeft size={14} /> Back to Resumes
         </Link>
         <h2 className="c-resume-edit-title">{id}</h2>

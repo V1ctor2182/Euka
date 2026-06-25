@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
-import { Link, Routes, Route, Navigate, useLocation } from 'react-router-dom'
-import { ArrowLeft, Briefcase } from 'lucide-react'
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom'
+import { Briefcase } from 'lucide-react'
 import CareerNav from './career/CareerNav'
 import AutopilotToggle from './career/AutopilotToggle'
 import Dashboard from './career/Dashboard'
@@ -53,9 +53,10 @@ function RootRedirect() {
 export default function CareerApp() {
   const location = useLocation()
 
-  // Persist last top-level tab whenever route changes
+  // Persist last top-level tab whenever route changes (routes are root-mounted
+  // now: /dashboard, /review, … — no /career prefix).
   useEffect(() => {
-    const match = location.pathname.match(/^\/career\/([^/]+)/)
+    const match = location.pathname.match(/^\/([^/]+)/)
     const tab = match?.[1]
     if (tab && VALID_TABS.includes(tab)) {
       try { localStorage.setItem(LAST_TAB_KEY, tab) } catch { /* private mode / quota */ }
@@ -66,11 +67,8 @@ export default function CareerApp() {
     <div className="career">
       <header className="c-header">
         <div className="c-header-left">
-          <Link to="/" className="c-back" aria-label="Back to Learn">
-            <ArrowLeft size={16} />
-          </Link>
           <Briefcase size={20} strokeWidth={2} />
-          <h1>Career</h1>
+          <h1>Euka Autopilot</h1>
         </div>
         <div className="c-header-right">
           <AutopilotToggle />
@@ -88,9 +86,9 @@ export default function CareerApp() {
           {/* autopilot-ui-reframe m4: legacy pages removed from nav; redirect
               their routes so old bookmarks don't 404. Overview→Dashboard,
               Pipeline/Shortlist→Jobs. */}
-          <Route path="overview" element={<Navigate to="/career/dashboard" replace />} />
-          <Route path="pipeline" element={<Navigate to="/career/find-jobs" replace />} />
-          <Route path="shortlist" element={<Navigate to="/career/find-jobs" replace />} />
+          <Route path="overview" element={<Navigate to="/dashboard" replace />} />
+          <Route path="pipeline" element={<Navigate to="/find-jobs" replace />} />
+          <Route path="shortlist" element={<Navigate to="/find-jobs" replace />} />
           <Route path="shortlist/needs-manual" element={<NeedsManualEnrich />} />
           <Route path="applied" element={<Applied />} />
           <Route path="prep" element={<Prep />} />
@@ -119,7 +117,9 @@ export default function CareerApp() {
             <Route path="*" element={<Navigate to="identity" replace />} />
           </Route>
           <Route path="settings/resumes/:id/edit" element={<ResumeEdit />} />
-          <Route path="*" element={<Navigate to="dashboard" replace />} />
+          {/* Absolute target: a relative "dashboard" would loop on deep unknown
+              paths now that routes are root-mounted (/jobs/dashboard/dashboard…). */}
+          <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
       </main>
     </div>

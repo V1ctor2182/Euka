@@ -171,7 +171,7 @@ export default function Shortlist() {
             {manualPasteCount} job{manualPasteCount === 1 ? '' : 's'} need manual JD paste —
             the enrich pipeline couldn&rsquo;t fetch the description.
           </span>
-          <Link to="/career/shortlist/needs-manual" className="sl-manual-nudge-link">
+          <Link to="/shortlist/needs-manual" className="sl-manual-nudge-link">
             Paste now →
           </Link>
         </div>
@@ -218,7 +218,7 @@ export default function Shortlist() {
             <>
               <strong>{pendingStageB}</strong> Stage A passer{pendingStageB === 1 ? '' : 's'} awaiting Stage B
               eval.{' '}
-              <Link to="/career/pipeline" className="sl-link">
+              <Link to="/pipeline" className="sl-link">
                 Go to Pipeline → run Stage B
               </Link>
             </>
@@ -231,7 +231,7 @@ export default function Shortlist() {
           {data && data.total === 0 ? (
             <>
               No Stage B-evaluated jobs yet. Head to{' '}
-              <Link to="/career/pipeline" className="sl-link">/career/pipeline</Link>{' '}
+              <Link to="/pipeline" className="sl-link">/career/pipeline</Link>{' '}
               to run Stage A + B first.
             </>
           ) : (
@@ -257,13 +257,13 @@ export default function Shortlist() {
                 <tr
                   key={row.id}
                   className="sl-row"
-                  onClick={() => navigate(`/career/reports/${row.id}`)}
+                  onClick={() => navigate(`/reports/${row.id}`)}
                   role="link"
                   tabIndex={0}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault()
-                      navigate(`/career/reports/${row.id}`)
+                      navigate(`/reports/${row.id}`)
                     }
                   }}
                 >
@@ -307,7 +307,7 @@ export default function Shortlist() {
                       title="Apply — Mode 1 draft + copy/paste flow"
                       onClick={(e) => {
                         e.stopPropagation()
-                        navigate(`/career/apply/${row.id}`)
+                        navigate(`/apply/${row.id}`)
                       }}
                     >
                       <Send size={12} />

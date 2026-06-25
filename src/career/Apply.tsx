@@ -524,7 +524,7 @@ export default function Apply() {
           return
         }
         setMarkToast('Applied! Redirecting…')
-        setTimeout(() => navigate('/career/applied'), 1200)
+        setTimeout(() => navigate('/applied'), 1200)
       } else if (decision === 'confirm_fallback') {
         autoMarkedRef.current = true
         const ok = window.confirm(
@@ -1001,7 +1001,7 @@ export default function Apply() {
         throw new Error(j.error ?? `Mark applied failed (HTTP ${r.status})`)
       }
       setMarkToast('Marked Applied. Redirecting…')
-      setTimeout(() => navigate('/career/applied'), 1400)
+      setTimeout(() => navigate('/applied'), 1400)
     } catch (e) {
       setError((e as Error).message ?? 'Mark applied failed')
     } finally {
@@ -1044,7 +1044,7 @@ export default function Apply() {
         <button
           type="button"
           className="ap-back"
-          onClick={() => navigate('/career/find-jobs')}
+          onClick={() => navigate('/find-jobs')}
         >
           <ArrowLeft size={14} /> Find Jobs
         </button>
@@ -1372,7 +1372,7 @@ export default function Apply() {
           )}
 
           <div className="ap-m2-foot">
-            <Link to="/career/find-jobs" className="ap-link">
+            <Link to="/find-jobs" className="ap-link">
               Back to Find Jobs
             </Link>
           </div>

@@ -252,7 +252,7 @@ export default function Applied() {
           {data.total === 0 ? (
             <>
               No applications yet. Head to{' '}
-              <Link to="/career/shortlist" className="ad-link">/career/shortlist</Link>{' '}
+              <Link to="/shortlist" className="ad-link">/career/shortlist</Link>{' '}
               to find jobs to apply to.
             </>
           ) : (
@@ -269,7 +269,7 @@ export default function Applied() {
               onAdvance={(target) => advanceStatus(row, target)}
               onOpenReport={() => {
                 const jobId = row.id.split('-')[0]
-                navigate(`/career/reports/${jobId}`)
+                navigate(`/reports/${jobId}`)
               }}
             />
           ))}

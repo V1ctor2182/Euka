@@ -761,7 +761,7 @@ function MetadataDrawer({
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           {resume.source === 'manual' ? (
             <Link
-              to={`/career/settings/resumes/${resumeId}/edit`}
+              to={`/settings/resumes/${resumeId}/edit`}
               className="af-btn-add"
               style={{ marginTop: 0, padding: '4px 10px', fontSize: 12, textDecoration: 'none' }}
               title="Open the full-page editor for base.md content"
@@ -781,7 +781,7 @@ function MetadataDrawer({
                 {syncing ? 'Syncing…' : 'Sync Now'}
               </button>
               <Link
-                to={`/career/settings/resumes/${resumeId}/edit`}
+                to={`/settings/resumes/${resumeId}/edit`}
                 className="af-btn-add"
                 style={{ marginTop: 0, padding: '4px 10px', fontSize: 12, textDecoration: 'none' }}
                 title="View synced markdown + PDF preview (read-only; edits happen in Google Docs)"

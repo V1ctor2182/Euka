@@ -150,20 +150,20 @@ export default function Dashboard() {
             {busy ? <Loader2 size={14} className="db-spin" /> : <Power size={14} />}
             {on ? 'Pause' : 'Start'}
           </button>
-          <Link to="/career/settings/preferences" className="db-btn db-btn-ghost"><SlidersHorizontal size={14} /> Tune</Link>
+          <Link to="/settings/preferences" className="db-btn db-btn-ghost"><SlidersHorizontal size={14} /> Tune</Link>
           <button type="button" className="db-btn db-btn-ghost" onClick={() => fetchAll()}><RefreshCw size={14} /> Refresh</button>
         </div>
       </section>
 
       {/* funnel: candidates → filling → parked → submitted */}
       <section className="db-funnel">
-        <FunnelCard n={funnel.candidates} label="候选" hint="符合条件待投" Icon={Search} to="/career/find-jobs" />
+        <FunnelCard n={funnel.candidates} label="候选" hint="符合条件待投" Icon={Search} to="/find-jobs" />
         <span className="db-funnel-arrow">→</span>
         <FunnelCard n={funnel.filling} label="填表中" hint="机器正在填" Icon={PenLine} />
         <span className="db-funnel-arrow">→</span>
-        <FunnelCard n={funnel.parked} label="待批准" hint="填好等你 Submit" Icon={Inbox} to="/career/applied" highlight />
+        <FunnelCard n={funnel.parked} label="待批准" hint="填好等你 Submit" Icon={Inbox} to="/applied" highlight />
         <span className="db-funnel-arrow">→</span>
-        <FunnelCard n={funnel.submitted} label="已提交" hint="已投出" Icon={Send} to="/career/applied" />
+        <FunnelCard n={funnel.submitted} label="已提交" hint="已投出" Icon={Send} to="/applied" />
       </section>
 
       {/* activity stream */}
@@ -183,7 +183,7 @@ export default function Dashboard() {
                   <span className="db-feed-time">{relTime(e.ts)}</span>
                   <span className="db-feed-co">{e.company || e.jobId || '—'}{e.role ? ` · ${e.role}` : ''}</span>
                   <span className="db-feed-label">{meta.label}</span>
-                  {actionable && <Link to="/career/applied" className="db-feed-action">去处理 →</Link>}
+                  {actionable && <Link to="/applied" className="db-feed-action">去处理 →</Link>}
                 </li>
               )
             })}

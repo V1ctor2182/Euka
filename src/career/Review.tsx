@@ -98,7 +98,7 @@ export default function Review() {
           <CheckCircle2 size={28} />
           <strong>收件箱清空了 🎉</strong>
           <p>没有待处理的申请。打开 Autopilot,机器投递后停在闸门的会出现在这里。</p>
-          <Link to="/career/dashboard" className="rv-btn rv-btn-ghost">← 回 Dashboard</Link>
+          <Link to="/dashboard" className="rv-btn rv-btn-ghost">← 回 Dashboard</Link>
         </div>
       )}
 
@@ -150,7 +150,7 @@ function ReviewCard({ item, bankable }: { item: ReviewItem; bankable?: boolean }
         {item.job_url && (
           <a href={item.job_url} target="_blank" rel="noreferrer" className="rv-btn rv-btn-ghost"><ExternalLink size={13} /> JD</a>
         )}
-        <Link to={`/career/apply/${encodeURIComponent(item.jobId)}`} className="rv-btn rv-btn-primary"><Send size={13} /> 去处理</Link>
+        <Link to={`/apply/${encodeURIComponent(item.jobId)}`} className="rv-btn rv-btn-primary"><Send size={13} /> 去处理</Link>
         {bankable && (
           <button type="button" className="rv-btn rv-btn-ghost" onClick={() => setOpen((o) => !o)}>
             <PenLine size={13} /> 存答案

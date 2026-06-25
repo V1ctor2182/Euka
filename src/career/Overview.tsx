@@ -450,11 +450,11 @@ export default function Overview() {
 
       {/* Quick links */}
       <div className="ov-quicklinks">
-        <Link to="/career/pipeline" className="ov-quicklink">→ Pipeline</Link>
-        <Link to="/career/shortlist" className="ov-quicklink">
+        <Link to="/pipeline" className="ov-quicklink">→ Pipeline</Link>
+        <Link to="/shortlist" className="ov-quicklink">
           → Shortlist ({shortlist?.total ?? 0})
         </Link>
-        <Link to="/career/applied" className="ov-quicklink">
+        <Link to="/applied" className="ov-quicklink">
           → Applied ({stats.appliedTabCount})
         </Link>
       </div>

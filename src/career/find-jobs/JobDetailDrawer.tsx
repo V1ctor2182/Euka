@@ -113,7 +113,7 @@ export default function JobDetailDrawer({
         {view.evaluation?.stage_b?.score != null && (
           <div className="c-fj-detail-eval c-fj-detail-eval-b">
             <strong>Stage B score:</strong> {view.evaluation.stage_b.score.toFixed(1)}
-            <Link to={`/career/reports/${jobId}`} className="c-fj-btn c-fj-btn-ghost c-fj-detail-report">
+            <Link to={`/reports/${jobId}`} className="c-fj-btn c-fj-btn-ghost c-fj-detail-report">
               <FileText size={13} /> Full report
             </Link>
           </div>

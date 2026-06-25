@@ -437,7 +437,7 @@ export default function Iteration() {
                 action: (
                   <a
                     className="c-iter-btn c-iter-btn-ghost"
-                    href="/career/learning"
+                    href="/learning"
                     title="Approve/Reject in Learning tab"
                   >
                     <ExternalLink size={14} /> Review

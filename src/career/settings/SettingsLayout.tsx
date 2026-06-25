@@ -34,8 +34,8 @@ const GROUPS: Group[] = [
       { to: 'integrations', label: 'Integrations', Icon: KeyRound },
       // Debug pages — pulled out of the main nav (absolute paths: they render as
       // full pages, not inside the settings Outlet).
-      { to: '/career/learning', label: 'Learning (debug)', Icon: TrendingDown, absolute: true },
-      { to: '/career/iteration', label: 'Iteration (debug)', Icon: Activity, absolute: true },
+      { to: '/learning', label: 'Learning (debug)', Icon: TrendingDown, absolute: true },
+      { to: '/iteration', label: 'Iteration (debug)', Icon: Activity, absolute: true },
     ],
   },
 ]
